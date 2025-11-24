@@ -4,3 +4,7 @@ moviepy==1.0.3
 numpy<2.0.0
 imageio-ffmpeg
 decorator
+google-generativeai
+edge-tts
+Pillow
+asyncio
