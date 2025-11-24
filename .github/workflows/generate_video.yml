@@ -49,3 +49,12 @@ jobs:
             git commit -m "🎥 Generated new video [skip ci]"
             git push
           fi
+        # Add 'continue-on-error' so artifact uploads even if push fails
+        continue-on-error: true 
+
+      # --- NEW STEP: ADDS DOWNLOAD BUTTON ---
+      - name: Upload Video as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-Short-Video
+          path: generated_videos/*.mp4
