@@ -6,212 +6,127 @@ import requests
 import textwrap
 from datetime import datetime
 
-# --- MOVIEPY & PILLOW COMPATIBILITY FIX ---
+# --- MOVIEPY & PILLOW FIX ---
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
-# ------------------------------------------
 
 import google.generativeai as genai
 import edge_tts
 from moviepy.editor import *
-from moviepy.video.fx.all import resize
 
-# ================= CONFIGURATION =================
-# 1. GET YOUR FREE KEY: https://aistudio.google.com/app/apikey
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" 
+# --- CONFIGURATION ---
+# Reads from GitHub Secrets first, falls back to local string for testing
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDw8GuHo9kKc6ttnOfM4FpYP7xhKcPAR_U")
 
 OUTPUT_FOLDER = "rendered_episodes"
 STATE_FILE = "story_history.json"
-RESOLUTION = (1080, 1920) # 9:16 Vertical HD
-Target_Duration = 30 # Seconds
+RESOLUTION = (1080, 1920)
 
-# ================= CHARACTER BANK =================
-# Forces specific visual descriptions when these keywords appear
 CHARACTER_PROMPTS = {
     "Arjuna": "Arjuna the warrior prince, handsome indian man, golden celestial armor, holding the Gandiva bow, divine glow, ancient vedic clothing",
     "Krishna": "Lord Krishna, blue skin, peacock feather in crown, yellow silk robes, serene smile, playing flute, divine aura",
     "Draupadi": "Draupadi, most beautiful indian queen, dark skin, elegant saree with gold embroidery, determined eyes, royal jewelry",
     "Bhishma": "Bhishma Pitamah, old wise warrior, white long beard, silver armor, stern expression, standing on a battlefield",
-    "Karna": "Karna, warrior with golden earrings and attached chest armor, sun glowing behind him, tragic hero look",
-    "Shantanu": "King Shantanu, royal indian king, ancient golden crown, regal robes, standing by the river ganges"
+    "Karna": "Karna, warrior with golden earrings and attached chest armor, sun glowing behind him, tragic hero look"
 }
 
-# ================= SETUP =================
 genai.configure(api_key=GEMINI_API_KEY)
-if not os.path.exists(OUTPUT_FOLDER):
-    os.makedirs(OUTPUT_FOLDER)
-
-# ================= FUNCTIONS =================
 
 def get_next_story_segment():
-    """Reads history and asks AI for the next 30s of the story."""
-    
-    # Load State
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             history = json.load(f)
     else:
-        history = {"last_summary": "The beginning.", "episode_count": 0}
+        history = {"last_summary": "The epic tale begins.", "episode_count": 0}
 
     episode_num = history['episode_count'] + 1
-    print(f"\n[*] Generating Script for Episode {episode_num}...")
+    print(f"[*] Generating Script for Episode {episode_num}...")
 
-    # Generative Model
     model = genai.GenerativeModel('gemini-2.0-flash-exp')
-    
     prompt = f"""
     You are the narrator of the Mahabharata. 
     Previous Context: {history['last_summary']}
-    
-    Task: Write the NEXT continuous part of the story.
-    Constraints:
-    1. Text must be spoken in approx 25-30 seconds (approx 60 words).
-    2. Tone: Dramatic, ancient, immersive.
-    3. Output must be valid JSON.
-    
-    JSON Structure:
-    {{
-        "script": "The spoken narration text...",
-        "image_prompt": "A highly detailed visual description of the scene...",
-        "summary": "A 1-sentence summary of what happened here (to save for next time)"
-    }}
+    Task: Write the NEXT continuous part of the story (30 seconds).
+    JSON Structure: {{ "script": "...", "image_prompt": "...", "summary": "..." }}
     """
-    
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         data = json.loads(response.text)
-        
-        # Update State in memory (save to file later)
         history['last_summary'] = data['summary']
         history['episode_count'] = episode_num
-        
         return data, history
     except Exception as e:
-        print(f"[!] AI Generation Error: {e}")
+        print(f"AI Error: {e}")
         return None, None
 
 def enhance_visuals(base_prompt, script):
-    """Injects character consistency and style keywords."""
     final_prompt = base_prompt
-    
-    # Check for character names in the script to enforce consistency
     for name, desc in CHARACTER_PROMPTS.items():
         if name in script or name in base_prompt:
             final_prompt += f", featuring {desc}"
-            print(f"    -> Character Detected: {name}")
-
-    # Add style boosters for "Flux" model
-    style = ", cinematic lighting, 8k, photorealistic, unreal engine 5 render, dramatic atmosphere, depth of field, ancient india aesthetic"
-    return final_prompt + style
+    return final_prompt + ", cinematic lighting, 8k, photorealistic, flux model style"
 
 def generate_image(prompt, filename):
-    """Fetches image from Pollinations (Flux Model)."""
-    print(f"[*] Generating Visuals...")
-    
-    encoded_prompt = requests.utils.quote(prompt)
-    # Random seed ensures unique images every time
-    seed = random.randint(1, 999999)
-    
-    # Flux model is sharper and more realistic
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&seed={seed}&model=flux&nologo=true"
-    
+    print(f"[*] Generating Image...")
     try:
+        encoded_prompt = requests.utils.quote(prompt)
+        seed = random.randint(1, 999999)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&seed={seed}&model=flux&nologo=true"
         resp = requests.get(url, timeout=60)
         if resp.status_code == 200:
             with open(filename, 'wb') as f:
                 f.write(resp.content)
             return True
-        else:
-            print(f"[!] Image API Error: {resp.status_code}")
     except Exception as e:
-        print(f"[!] Image Connection Error: {e}")
+        print(f"Image Error: {e}")
     return False
 
 async def generate_audio(text, filename):
-    """Generates realistic AI voiceover."""
     print(f"[*] Synthesizing Audio...")
-    # 'en-IN-PrabhatNeural' is a male Indian accent, perfect for this context
     communicate = edge_tts.Communicate(text, "en-IN-PrabhatNeural", pitch='-2Hz', rate='-5%')
     await communicate.save(filename)
 
 def create_motion_video(image_path, audio_path, output_path):
-    """Combines image and audio with a vertical pan effect."""
     print("[*] Rendering Video...")
-    
     try:
-        # 1. Load Audio
         audio_clip = AudioFileClip(audio_path)
-        duration = audio_clip.duration + 0.5 # Small buffer
+        img_clip = ImageClip(image_path).set_duration(audio_clip.duration + 0.5)
         
-        # 2. Load Image
-        img_clip = ImageClip(image_path).set_duration(duration)
-        
-        # 3. Create Pan Effect (Ken Burns)
-        # Resize height to 120% of screen to allow scrolling
-        zoomed_height = int(RESOLUTION[1] * 1.2)
-        img_clip = img_clip.resize(height=zoomed_height)
-        
-        # Pan from Top-Center to Bottom-Center
-        # 't' is current time. We move Y coordinate based on time.
-        # Start at y=0, move up (negative y) slowly
+        # Pan Effect
+        img_clip = img_clip.resize(height=int(RESOLUTION[1] * 1.2))
         img_clip = img_clip.set_position(lambda t: ('center', -10 - (t * 30)))
         
-        # 4. Composite
-        final_clip = CompositeVideoClip([img_clip], size=RESOLUTION)
-        final_clip = final_clip.set_audio(audio_clip)
-        
-        # 5. Export
-        final_clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', preset='medium', verbose=False, logger=None)
+        final_clip = CompositeVideoClip([img_clip], size=RESOLUTION).set_audio(audio_clip)
+        final_clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
         return True
-        
     except Exception as e:
-        print(f"[!] Rendering Failed: {e}")
+        print(f"Render Error: {e}")
         return False
 
-# ================= MAIN EXECUTION =================
-
 def main():
-    # 1. Generate Content
+    if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
+    
     story_data, new_history = get_next_story_segment()
-    if not story_data:
-        return
+    if not story_data: return
 
     script = story_data['script']
-    raw_prompt = story_data['image_prompt']
     episode_num = new_history['episode_count']
-
-    print(f"\n--- Episode {episode_num} ---")
-    print(f"Script: {textwrap.shorten(script, width=60)}")
     
-    # 2. Prepare Assets
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     temp_img = "temp_visual.jpg"
     temp_audio = "temp_audio.mp3"
     final_video = f"{OUTPUT_FOLDER}/Ep{episode_num}_Mahabharata_{timestamp}.mp4"
     
-    # 3. Create Media
-    final_prompt = enhance_visuals(raw_prompt, script)
-    
-    if generate_image(final_prompt, temp_img):
-        # Run Async Audio Gen
+    if generate_image(enhance_visuals(story_data['image_prompt'], script), temp_img):
         asyncio.run(generate_audio(script, temp_audio))
-        
-        # Render
         if create_motion_video(temp_img, temp_audio, final_video):
-            print(f"\n[SUCCESS] Video Saved: {final_video}")
-            
-            # Save History ONLY if video succeeded
+            print(f"[SUCCESS] Video Saved: {final_video}")
             with open(STATE_FILE, 'w') as f:
                 json.dump(new_history, f, indent=4)
-                print("[*] Story progress saved.")
-        
-    # Cleanup
+
     if os.path.exists(temp_img): os.remove(temp_img)
     if os.path.exists(temp_audio): os.remove(temp_audio)
 
 if __name__ == "__main__":
-    if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
-        print("ERROR: Please put your Gemini API Key in line 18 of daily_epic.py")
-    else:
-        main()
+    main()
