@@ -1,9 +1,7 @@
-yfinance
-edge-tts
 moviepy==1.0.3
-Pillow
-deep-translator
-mplfinance
-pandas
+Pillow>=10.0.0
 requests
+edge-tts
+deep-translator
+yfinance
 beautifulsoup4
