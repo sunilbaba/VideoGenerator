@@ -5,4 +5,5 @@ yfinance
 edge-tts
 deep-translator
 mplfinance
-pandas_ta
+pandas
+numpy
