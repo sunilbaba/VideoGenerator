@@ -1,12 +1,11 @@
+
 #!/usr/bin/env python3
 """
-CI-friendly slides video generator:
- - Uses PIL to render text slides (no ImageMagick/TextClip)
- - Per-slide TTS (edge-tts) in Telugu
- - Company logo watermark (logo.png in repo root) - optional
- - Dark gradient overlay for readability
- - Ken-Burns zoom, fade-in/out cinematic transitions
- - Outputs MP4 to generated_videos/
+Cinematic slide video generator (per-slide TTS) that uses Pillow for text rendering
+so ImageMagick / TextClip are not required on CI.
+
+Outputs: generated_videos/<title>_<timestamp>.mp4
+Place optional company logo at assets/logo.png (recommended).
 """
 
 import os
@@ -20,18 +19,17 @@ import traceback
 from datetime import datetime
 from io import BytesIO
 
-# third-party libs (install in requirements.txt)
-import yfinance as yf
-import edge_tts
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip
-from moviepy.video.fx.all import fadein, fadeout
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip, concatenate_audioclips
 from deep_translator import GoogleTranslator
+import edge_tts
+import yfinance as yf
 from bs4 import BeautifulSoup
 
-# ========== CONFIG ==========
+# ---------- CONFIG ----------
 OUTPUT_FOLDER = "generated_videos"
-VIDEO_MODE = "PORTRAIT"   # "PORTRAIT" or "LANDSCAPE"
+VIDEO_MODE = "PORTRAIT"  # PORTRAIT or LANDSCAPE
+
 if VIDEO_MODE == "PORTRAIT":
     RESOLUTION = (1080, 1920)
 else:
@@ -40,29 +38,33 @@ else:
 VOICE = "te-IN-ShrutiNeural"
 MIN_SLIDE_CHARS = 40
 MAX_SLIDE_CHARS = 1200
-PADDING_PER_SLIDE = 0.35   # seconds padding per slide
-FADE_DURATION = 1.2
-ZOOM_FACTOR = 0.06         # 6% zoom during slide
-APP_LOGO_FILENAME = "logo.png"  # optional logo in repo root
-FONT_PRIMARY = None        # will be auto-detected
-FONT_BOLD = None
-
+APP_LOGO_PATH = "assets/logo.png"  # optional; watermark; create assets/ folder and put logo.png there
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # common on ubuntu runners
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+]
 FALLBACK_IMAGES = [
     "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1080&h=1920&fit=crop",
     "https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=1080&h=1920&fit=crop",
     "https://images.unsplash.com/photo-1535320903710-d9cf63d4040c?q=80&w=1080&h=1920&fit=crop",
-    "https://images.unsplash.com/photo-1642543492481-44e81e3914a7?q=80&w=1080&h=1920&fit=crop"
 ]
+WATCHLIST = ["RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS","HINDUNILVR.NS","SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LICI.NS","LT.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS"]
 
-WATCHLIST = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-    "HINDUNILVR.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS",
-    "LICI.NS", "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS"
-]
+# cinematic params (you chose 'C' earlier)
+FADE_DURATION = 1.2
+PADDING_PER_SLIDE = 0.35
+ZOOM_FACTOR = 0.06
 
-# ========================== Helpers ==========================
-def log(*args, **kwargs):
-    print(*args, **kwargs, flush=True)
+# ---------------- utilities ----------------
+def load_font(size, prefer_bold=False):
+    for p in FONT_PATHS:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                continue
+    # fallback to PIL default
+    return ImageFont.load_default()
 
 def _retry_request(func, retries=3, backoff=1.5):
     last = None
@@ -71,511 +73,401 @@ def _retry_request(func, retries=3, backoff=1.5):
             return func()
         except Exception as e:
             last = e
-            sleep_t = backoff * (2 ** i)
-            log(f"[RETRY] attempt {i+1}/{retries} failed: {e} — sleeping {sleep_t:.1f}s")
-            time.sleep(sleep_t)
+            time.sleep(backoff * (2 ** i))
     raise last
 
-# ========================== Fonts ==========================
-def find_font_paths():
-    """
-    Try common DejaVu fonts on ubuntu runners. Return (regular_path, bold_path) or (None, None).
-    """
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
-    ]
-    reg = None
-    bold = None
-    for p in candidates:
-        if os.path.exists(p):
-            if "Bold" in os.path.basename(p) or "-B" in os.path.basename(p) or "Ubuntu-B" in p:
-                if not bold:
-                    bold = p
-            else:
-                if not reg:
-                    reg = p
-    return reg, bold
-
-def load_fonts():
-    global FONT_PRIMARY, FONT_BOLD
-    reg, bold = find_font_paths()
-    try:
-        if reg:
-            FONT_PRIMARY = ImageFont.truetype(reg, size=48)
-            log(f"[INFO] Loaded primary font: {reg}")
-        else:
-            FONT_PRIMARY = ImageFont.load_default()
-            log("[WARN] Default PIL font loaded (no DejaVu found).")
-        if bold:
-            FONT_BOLD = ImageFont.truetype(bold, size=72)
-            log(f"[INFO] Loaded bold font: {bold}")
-        else:
-            # try using primary with larger size as fallback
-            FONT_BOLD = ImageFont.truetype(reg, size=72) if reg else ImageFont.load_default()
-    except Exception as e:
-        log("[WARN] Font load failed, using defaults:", e)
-        FONT_PRIMARY = ImageFont.load_default()
-        FONT_BOLD = ImageFont.load_default()
-
-# ========================== Data selection ==========================
+# ---------------- get data ----------------
 def get_trending_stock():
-    log("[*] Scanning watchlist for news...")
     random.shuffle(WATCHLIST)
     for ticker in WATCHLIST[:15]:
         try:
             stock = yf.Ticker(ticker)
             news = getattr(stock, "news", None) or []
-            if news and len(news) > 0:
+            if news:
                 latest = news[0]
-                title = latest.get("title", "Market Update")
-                publisher = latest.get("publisher", "News")
-                link = latest.get("link") or latest.get("url")
+                title = latest.get('title','Market Update')
+                link = latest.get('link') or latest.get('url')
                 info = getattr(stock, "info", {}) or {}
-                name = info.get("shortName", ticker)
-                price = info.get("currentPrice", 0)
-                mcap = int(info.get("marketCap", 0) / 10000000) if info.get("marketCap") else 0
-                script = f"Breaking Stock Market Update on {name}. Price: {price} rupees. {title}. Market cap: {mcap} crore."
+                name = info.get('shortName', ticker)
+                price = info.get('currentPrice',0)
+                mcap = int(info.get('marketCap',0)/10000000) if info.get('marketCap') else 0
+                script = f"Breaking update on {name}. Current price {price} rupees. {title}."
                 return {"type":"news","title":f"News_{ticker}","name":name,"script":script,"article_link":link}
-        except Exception as e:
-            log(f"[WARN] error checking {ticker}: {e}")
+        except Exception:
             continue
     return None
 
 def get_market_analysis_data():
-    log("[*] No news found, using market analysis fallback.")
-    indices = [{"ticker":"^NSEI","name":"Nifty 50"},{"ticker":"^NSEBANK","name":"Bank Nifty"}]
+    import random
+    indices=[{"ticker":"^NSEI","name":"Nifty 50"},{"ticker":"^NSEBANK","name":"Bank Nifty"}]
     target = random.choice(indices)
-    try:
-        stock = yf.Ticker(target["ticker"])
-        hist = stock.history(period="1mo")
-        if hist.shape[0] < 2:
-            raise ValueError("not enough history")
-        current = hist["Close"].iloc[-1]
-        prev = hist["Close"].iloc[-2]
-        change = current - prev
-        pct = (change/prev)*100
-        trend = "bullish" if change>0 else "bearish"
-        script = f"{target['name']} shows a {trend} move of {abs(round(pct,2))}% today at {int(current)} points."
-        return {"type":"technical","title":f"Technical_{target['name']}","name":target['name'],"script":script,"article_link":None}
-    except Exception as e:
-        log("[ERROR] market analysis failed:", e)
+    stock = yf.Ticker(target['ticker'])
+    hist = stock.history(period="1mo")
+    if hist.shape[0] < 2:
         return None
+    cur = hist['Close'].iloc[-1]; prev = hist['Close'].iloc[-2]
+    change = cur - prev
+    pct = (change/prev)*100
+    trend = "bullish" if change>0 else "bearish"
+    script = f"{target['name']} shows a {trend} move of {abs(round(pct,2))}% today."
+    return {"type":"technical","title":f"Technical_{target['name']}","name":target['name'],"script":script,"article_link":None}
 
-# ========================== Scrape article ==========================
+# ---------------- article scraping ----------------
 def fetch_article_text(url):
     if not url:
         return None
     try:
-        log(f"[*] Fetching article: {url}")
-        headers = {"User-Agent":"Mozilla/5.0 (compatible; Bot/1.0)"}
+        headers = {"User-Agent":"Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        paragraphs = []
-        article_tag = soup.find("article")
-        if article_tag:
-            for p in article_tag.find_all("p"):
-                t = p.get_text(strip=True)
-                if t:
-                    paragraphs.append(t)
-        if not paragraphs:
-            # heuristic: pick largest div with many <p>
+        paras=[]
+        article = soup.find("article")
+        if article:
+            for p in article.find_all("p"):
+                t=p.get_text(strip=True)
+                if t: paras.append(t)
+        if not paras:
             candidates = soup.find_all(["div","section"])
-            best = None
-            best_count = 0
+            best=None; best_count=0
             for c in candidates:
                 ps = c.find_all("p")
                 if len(ps) > best_count:
-                    best_count = len(ps)
-                    best = c
+                    best_count = len(ps); best = c
             if best and best_count>0:
                 for p in best.find_all("p"):
-                    t = p.get_text(strip=True)
-                    if t:
-                        paragraphs.append(t)
-        if not paragraphs:
+                    t=p.get_text(strip=True)
+                    if t: paras.append(t)
+        if not paras:
             meta = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name":"description"})
             if meta and meta.get("content"):
-                paragraphs = [meta.get("content").strip()]
-        if not paragraphs:
+                paras = [meta.get("content").strip()]
+        if not paras:
             ps = soup.find_all("p")
             for p in ps[:10]:
-                t = p.get_text(strip=True)
-                if t:
-                    paragraphs.append(t)
-        if not paragraphs:
-            log("[WARN] Could not extract article paragraphs.")
+                t=p.get_text(strip=True)
+                if t: paras.append(t)
+        if not paras:
             return None
-        full = "\n\n".join(paragraphs)
+        full = "\n\n".join(paras)
         if len(full) > MAX_SLIDE_CHARS*10:
-            full = full[:MAX_SLIDE_CHARS*10].rsplit(" ",1)[0] + "..."
+            full = full[:MAX_SLIDE_CHARS*10].rsplit(" ",1)[0]+"..."
         return full
-    except Exception as e:
-        log("[WARN] fetch_article_text failed:", e)
+    except Exception:
         return None
 
-# ========================== Split slides & short slide handling ==========================
+# ---------------- split into slides & merge short ----------------
 def split_text_into_slides(text, title=None, approx_chars=700):
     if not text:
         return []
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    slides = []
+    slides=[]
     if title:
-        slides.append({"title": title, "body": ""})
-    cur = []
-    cur_len = 0
+        slides.append({"title":title,"body":""})
+    cur=[]; cur_len=0
     for p in paras:
-        plen = len(p)
-        if cur_len + plen + 2 <= approx_chars:
-            cur.append(p); cur_len += plen + 2
+        pl = len(p)
+        if cur_len + pl + 2 <= approx_chars:
+            cur.append(p); cur_len+=pl+2
         else:
-            slides.append({"title": None, "body": "\n\n".join(cur)})
-            cur = [p]; cur_len = plen + 2
+            slides.append({"title":None,"body":"\n\n".join(cur)})
+            cur=[p]; cur_len=pl+2
     if cur:
-        slides.append({"title": None, "body": "\n\n".join(cur)})
-    # merge/skip very short slides
-    out = []
+        slides.append({"title":None,"body":"\n\n".join(cur)})
+
+    # merge/skip short slides
+    cleaned=[]
     for s in slides:
         body = (s.get("body") or "").strip()
-        if len(body) < MIN_SLIDE_CHARS:
-            if out and not out[-1].get("title"):
-                # merge to previous
-                out[-1]["body"] = (out[-1].get("body","") + "\n\n" + body).strip()
+        if body and len(body) < MIN_SLIDE_CHARS:
+            if cleaned and not cleaned[-1].get("title"):
+                cleaned[-1]["body"] = (cleaned[-1].get("body","") + "\n\n" + body).strip()
             else:
-                # if first slide is short, keep it (title may exist) else drop
-                if s.get("title"):
-                    out.append(s)
+                # try to attach to next later: for simplicity attach to previous or skip
+                if cleaned:
+                    cleaned[-1]["body"] = (cleaned[-1].get("body","") + "\n\n" + body).strip()
                 else:
-                    # attempt to append to next by making it pending: just append now
-                    out.append(s)
+                    # single short slide -> keep as title slide or skip
+                    cleaned.append(s)
         else:
-            out.append(s)
-    if len(out) > 14:
+            cleaned.append(s)
+    if len(cleaned) > 14:
         return split_text_into_slides(text, title=title, approx_chars=1200)
-    return out
+    return cleaned
 
-# ========================== Background / gradient / logo ==========================
-def download_background(path):
-    for url in FALLBACK_IMAGES:
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            ctype = r.headers.get("Content-Type","")
-            if ctype.startswith("image/"):
-                with open(path,"wb") as f: f.write(r.content)
-                return True
-        except Exception:
-            continue
-    # fallback: solid color
-    img = Image.new("RGB", RESOLUTION, (12,12,12))
-    img.save(path, quality=90)
-    return True
-
-def apply_dark_gradient(img, top_opacity=220, bottom_opacity=90):
-    """
-    Overlay a vertical dark gradient to help text readability.
-    top_opacity, bottom_opacity in 0-255 (alpha)
-    """
-    w,h = img.size
-    gradient = Image.new("L", (1,h))
-    for y in range(h):
-        # linear interpolation
-        a = int(top_opacity + (bottom_opacity - top_opacity) * (y / h))
-        gradient.putpixel((0,y), max(0, min(255,a)))
-    alpha = gradient.resize((w,h))
-    black = Image.new("RGBA", (w,h), color=(0,0,0,0))
-    black.putalpha(alpha)
-    base = img.convert("RGBA")
-    combined = Image.alpha_composite(base, black)
-    return combined.convert("RGB")
-
-def add_logo_watermark(img, logo_path, size_ratio=0.12, margin=36, opacity=200):
-    """
-    Paste logo at top-left with margin. size_ratio relative to width.
-    """
-    try:
-        logo = Image.open(logo_path).convert("RGBA")
-        w,h = img.size
-        target_w = int(w * size_ratio)
-        # maintain aspect
-        aspect = logo.width / logo.height
-        target_h = int(target_w / aspect)
-        logo = logo.resize((target_w, target_h), Image.LANCZOS)
-        # apply opacity
-        if opacity < 255:
-            alpha = logo.split()[3].point(lambda p: p * (opacity/255.0))
-            logo.putalpha(alpha)
-        img_rgba = img.convert("RGBA")
-        img_rgba.paste(logo, (margin, margin), logo)
-        return img_rgba.convert("RGB")
-    except Exception as e:
-        log("[WARN] add_logo_watermark failed:", e)
-        return img
-
-# ========================== Render slide image with PIL ==========================
-def render_slide_image(slide, out_path, logo_path=None):
-    """
-    Draws a slide image using PIL and saves PNG to out_path.
-    slide = {'title':..., 'body':...}
-    """
-    W,H = RESOLUTION
-    # background base image - we create a simple neutral gradient background
-    base = Image.new("RGB", (W,H), (18,18,18))
-    draw = ImageDraw.Draw(base)
-
-    # optionally use a background image if we saved one under bg.png (downloaded earlier)
-    bg_file = "bg_image.jpg"
-    if os.path.exists(bg_file):
-        try:
-            bg = Image.open(bg_file).convert("RGB")
-            bg = bg.resize((W,H), Image.LANCZOS)
-            base = bg
-            draw = ImageDraw.Draw(base)
-        except Exception:
-            pass
-
-    # overlay dark gradient for readability
-    base = apply_dark_gradient(base, top_opacity=200, bottom_opacity=60)
-    draw = ImageDraw.Draw(base)
-
-    # draw content (title or body)
-    padding_x = 80
-    usable_w = W - padding_x*2
-
-    if slide.get("title"):
-        # Title card
-        title_text = slide["title"]
-        font = FONT_BOLD if FONT_BOLD else FONT_PRIMARY
-        # adaptive size: try to fit in two lines
-        fontsize = 100
-        # find largest fontsize that fits roughly
-        for sz in (100, 90, 80, 72, 60, 48):
-            f = ImageFont.truetype(font.path, sz) if hasattr(font, "path") else ImageFont.load_default()
-            # measure text wrapped to two lines
-            lines = textwrap.wrap(title_text, width=24)
-            w_needed = max([draw.textsize(line, font=f)[0] for line in lines]) if lines else 0
-            if w_needed < usable_w:
-                fontsize = sz
-                break
-        try:
-            f = ImageFont.truetype(font.path, fontsize) if hasattr(font, "path") else font
-        except Exception:
-            f = FONT_BOLD if FONT_BOLD else FONT_PRIMARY
-        # center text vertically a bit above middle
-        lines = textwrap.wrap(title_text, width=24)
-        y = int(H*0.28)
-        for line in lines:
-            w_t, h_t = draw.textsize(line, font=f)
-            x = int((W - w_t)/2)
-            draw.text((x, y), line, font=f, fill=(255,255,255))
-            y += h_t + 8
-    else:
-        # Body card
-        body_text = slide.get("body","")
-        font = FONT_PRIMARY
-        # choose fontsize by checking text length
-        fontsize = 44 if VIDEO_MODE=="PORTRAIT" else 36
-        try:
-            if hasattr(font, "path"):
-                f = ImageFont.truetype(font.path, fontsize)
-            else:
-                f = font
-        except Exception:
-            f = FONT_PRIMARY
-        # wrap text to fit usable_w (determine chars per line heuristically)
-        avg_char_width = f.getsize("A")[0] if hasattr(f, "getsize") else 10
-        chars_per_line = max(30, int(usable_w / (avg_char_width+0.1)))
-        wrapped = textwrap.fill(body_text, width=chars_per_line)
-        # draw starting y slightly lower top
-        y = int(H*0.18)
-        lines = wrapped.split("\n")
-        for line in lines:
-            w_t, h_t = draw.textsize(line, font=f)
-            x = int((W - w_t)/2)
-            draw.text((x, y), line, font=f, fill=(240,240,240))
-            y += h_t + 8
-
-    # logo watermark
-    if logo_path and os.path.exists(logo_path):
-        try:
-            base = add_logo_watermark(base, logo_path, size_ratio=0.12, margin=36, opacity=210)
-        except Exception as e:
-            log("[WARN] watermark failed:", e)
-
-    # Save PNG
-    base.save(out_path, format="PNG", optimize=True)
-    return out_path
-
-# ========================== Per-slide TTS ==========================
+# ---------------- per-slide TTS ----------------
 async def synthesize_slide_tts(text, out_path):
-    """
-    Translate to Telugu and synthesize with edge-tts.
-    """
     try:
         telugu = GoogleTranslator(source='auto', target='te').translate(text)
         comm = edge_tts.Communicate(telugu, VOICE)
         await comm.save(out_path)
         return True
     except Exception as e:
-        log("[ERROR] synthesize_slide_tts failed:", e)
-        traceback.print_exc()
+        print("[WARN] TTS failed for slide:", e)
+        # fallback: create a short silent mp3 using moviepy AudioClip
+        from moviepy.audio.AudioClip import AudioClip
+        silence = AudioClip(lambda t: 0*t, duration=3.0).set_fps(44100)
+        silence.write_audiofile(out_path, fps=44100, codec="mp3", verbose=False, logger=None)
         return False
 
-# ========================== Compose clips ==========================
-def make_zoomed_imageclip(img_path, duration):
-    """
-    Return ImageClip that applies a gentle zoom (moviepy resize with function)
-    """
-    clip = ImageClip(img_path).set_duration(duration)
-    try:
-        clip = clip.resize(lambda t: 1.0 + ZOOM_FACTOR * (t / duration))
-    except Exception:
-        clip = clip.set_duration(duration)
-    return clip
+# ---------------- background & gradient & watermark ----------------
+def download_background(path):
+    for url in FALLBACK_IMAGES:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200 and r.headers.get("Content-Type","").startswith("image/"):
+                with open(path,"wb") as f: f.write(r.content)
+                return True
+        except Exception:
+            continue
+    # create solid
+    img = Image.new("RGB", RESOLUTION, (18,18,18))
+    img.save(path, quality=90)
+    return True
 
-# ========================== Main flow ==========================
+def add_dark_gradient_and_logo(input_image_path, out_path, logo_path=None):
+    # open bg, add dark gradient overlay and optional logo watermark
+    bg = Image.open(input_image_path).convert("RGBA")
+    w,h = bg.size
+
+    # create vertical gradient alpha (top lighter, bottom darker)
+    gradient = Image.new("L", (1,h))
+    for y in range(h):
+        # top 0 -> alpha 0.2*255, bottom -> 0.7*255 (darker overlay)
+        a = int( (0.2 + 0.5 * (y / h)) * 255 )
+        gradient.putpixel((0,y), a)
+    alpha = gradient.resize((w,h))
+    black = Image.new("RGBA", (w,h), (6,6,8,255))
+    black.putalpha(alpha)
+
+    composed = Image.alpha_composite(bg, black)
+
+    # add soft vignette
+    vign = Image.new("L", (w,h))
+    for y in range(h):
+        for x in range(w):
+            # distance from center
+            dx = (x - w/2)/(w/2)
+            dy = (y - h/2)/(h/2)
+            d = (dx*dx + dy*dy)**0.5
+            # vignette value
+            v = int( max(0, min(255, (d*1.2)*255)) )
+            vign.putpixel((x,y), v)
+    vign_blur = vign.filter(ImageFilter.GaussianBlur(radius=50))
+    black2 = Image.new("RGBA",(w,h),(0,0,0))
+    black2.putalpha(vign_blur)
+    final = Image.alpha_composite(composed, black2)
+
+    # add logo (bottom-right)
+    if logo_path and os.path.exists(logo_path):
+        try:
+            logo = Image.open(logo_path).convert("RGBA")
+            # scale logo to ~12% width
+            lw = int(w * 0.12)
+            lh = int(logo.size[1] * (lw / logo.size[0]))
+            logo = logo.resize((lw, lh), Image.LANCZOS)
+            # paste with 85% opacity
+            logo_mask = logo.split()[3].point(lambda p: p * 0.85)
+            final.paste(logo, (w - lw - 40, h - lh - 40), mask=logo_mask)
+        except Exception:
+            pass
+
+    final.convert("RGB").save(out_path, quality=92)
+
+# ---------------- render text to image using PIL ----------------
+def render_text_image(title_text, body_text, out_path, title_font_size=86, body_font_size=44):
+    # create a blank RGBA canvas and draw title/body
+    w,h = RESOLUTION
+    canvas = Image.new("RGBA", (w,h), (0,0,0,0))
+    draw = ImageDraw.Draw(canvas)
+
+    # fonts
+    title_font = load_font(title_font_size)
+    body_font = load_font(body_font_size)
+
+    # title (centered near top)
+    y_cursor = int(h * 0.12)
+    if title_text:
+        # wrap title
+        max_title_width = int(w * 0.84)
+        # naive wrap by characters using textwrap (works fine for most)
+        wrapped_title = textwrap.fill(title_text, width=30)
+        # measure and draw
+        lines = wrapped_title.splitlines()
+        for line in lines:
+            tw, th = draw.textsize(line, font=title_font)
+            draw.text(((w - tw) // 2, y_cursor), line, font=title_font, fill=(255,255,255,255))
+            y_cursor += th + 12
+        y_cursor += 18
+
+    # body (left aligned, wrapped)
+    if body_text:
+        left = int(w * 0.07)
+        right = int(w * 0.07)
+        box_w = w - left - right
+        # wrap body_text into lines approximate by characters per line
+        approx_chars_per_line = max(30, int(box_w / (body_font_size * 0.45)))
+        wrapped_body = textwrap.fill(body_text, width=approx_chars_per_line)
+        lines = wrapped_body.splitlines()
+        # ensure bottom margin
+        max_lines = int((h - y_cursor - 150) / (body_font_size + 6))
+        lines = lines[:max_lines]
+        for line in lines:
+            draw.text((left, y_cursor), line, font=body_font, fill=(240,240,240,255))
+            wline, hline = draw.textsize(line, font=body_font)
+            y_cursor += hline + 8
+
+    # save
+    canvas.convert("RGB").save(out_path, quality=92)
+
+# ---------------- create slide clip using generated image + audio ----------------
+def create_slide_clip_from_image(image_path, audio_path, idx, total):
+    # load audio to get duration
+    audio_clip = AudioFileClip(audio_path)
+    base_dur = audio_clip.duration
+    duration = max(2.5, base_dur + PADDING_PER_SLIDE)
+
+    img_clip = ImageClip(image_path).set_duration(duration)
+    # Ken-Burns zoom: using resize with lambda
+    try:
+        img_clip = img_clip.resize(lambda t: 1.0 + ZOOM_FACTOR * (t / duration)).set_duration(duration)
+    except Exception:
+        img_clip = img_clip.set_duration(duration)
+
+    # small footer
+    footer_text = f"{idx+1}/{total}"
+    # we draw footer via another small ImageClip created by PIL
+    footer_img = Image.new("RGBA", (400,80), (0,0,0,0))
+    draw = ImageDraw.Draw(footer_img)
+    ffont = load_font(28)
+    tw, th = draw.textsize(footer_text, font=ffont)
+    draw.text((400-tw-10, 10), footer_text, font=ffont, fill=(230,230,230,200))
+    footer_img_path = image_path + f".footer.{idx}.png"
+    footer_img.convert("RGB").save(footer_img_path, quality=80)
+    footer_clip = ImageClip(footer_img_path).set_duration(duration).set_position(("right", RESOLUTION[1]-90))
+
+    comp = CompositeVideoClip([img_clip, footer_clip], size=RESOLUTION).set_duration(duration)
+    # cinematic fades
+    comp = comp.fx(lambda clip: clip.crossfadein(FADE_DURATION)).fx(lambda clip: clip.crossfadeout(FADE_DURATION))
+    # set audio (pad/pad silence)
+    if audio_clip.duration < duration:
+        silence = AudioFileClip(os.path.join(os.path.dirname(__file__), "silent_placeholder.mp3")) if False else None
+        # simple silence using moviepy
+        from moviepy.audio.AudioClip import AudioClip
+        silence = AudioClip(lambda t: 0*t, duration=(duration - audio_clip.duration)).set_fps(44100)
+        audio_final = concatenate_audioclips([audio_clip, silence])
+    else:
+        audio_final = audio_clip.subclip(0, duration)
+    comp = comp.set_audio(audio_final)
+    # cleanup footer temp file after it's used? leave for now - will be cleaned at end
+    return comp
+
+# ---------------- main flow ----------------
 async def main():
-    load_fonts()
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    base_dir = os.getcwd()
+    base = os.getcwd()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bg_file = os.path.join(base_dir, "bg_image.jpg")
-    logo_path = os.path.join(base_dir, APP_LOGO_FILENAME)
+    bg_path = os.path.join(base, "temp_bg.jpg")
+    bg_gradient_path = os.path.join(base, "temp_bg_grad.jpg")
+
     try:
-        # 1. topic
         data = get_trending_stock()
         if not data:
             data = get_market_analysis_data()
         if not data:
-            log("[CRITICAL] no data found. exiting.")
+            print("[CRITICAL] No data fetched; exiting.")
             sys.exit(1)
-        title = data.get("name") or data.get("title")
-        out_filename = f"{data.get('title')}_{timestamp}.mp4"
-        out_path = os.path.join(base_dir, OUTPUT_FOLDER, out_filename)
 
-        # 2. article text
+        title = data.get("name") or data.get("title")
+        final_filename = f"{data.get('title')}_{timestamp}.mp4"
+        out_path = os.path.join(base, OUTPUT_FOLDER, final_filename)
+
+        # get article text
         article_text = None
         link = data.get("article_link")
         if link:
-            if link.startswith("/"):
-                link = None
-            else:
-                article_text = fetch_article_text(link)
+            article_text = fetch_article_text(link)
         if not article_text:
-            article_text = data.get("script") or f"{title} - market update."
+            article_text = data.get("script") or f"{title} - Market update."
 
-        # 3. slides
+        # split into slides
         slides = split_text_into_slides(article_text, title=title, approx_chars=700)
         if not slides:
             slides = [{"title": title, "body": data.get("script","")}]
 
-        log(f"[*] Slides created: {len(slides)}")
+        # download background and overlay gradient and watermark
+        download_background(bg_path)
+        logo_path = APP_LOGO_PATH if os.path.exists(APP_LOGO_PATH) else None
+        add_dark_gradient_and_logo(bg_path, bg_gradient_path, logo_path=logo_path)
 
-        # 4. download bg if possible
-        download_background(bg_file)
-
-        # 5. generate per-slide images & audio
-        slide_images = []
-        slide_audios = []
+        # make per-slide images and per-slide audio
+        slide_image_paths = []
+        slide_audio_paths = []
         for idx, s in enumerate(slides):
-            img_path = os.path.join(base_dir, f"slide_{idx}.png")
-            # render slide image with gradient + optional footer + watermark
-            render_slide_image(s, img_path, logo_path if os.path.exists(logo_path) else None)
-            slide_images.append(img_path)
-            # prepare text to speak: prefer title for title slides, else body
-            to_speak = s.get("title") if s.get("title") else s.get("body","")
-            if not to_speak or len(to_speak.strip())==0:
-                # create a short silent audio as fallback (3 seconds)
-                audio_file = os.path.join(base_dir, f"slide_{idx}.mp3")
-                silence = AudioFileClip(make_silent_audio(3.0))
-                # but making silence via moviepy is heavier; instead create empty file using edge-tts with a dot? simpler: use small TTS
-                ok = await synthesize_slide_tts(" ", audio_file)
-                slide_audios.append(audio_file)
+            # build text
+            slug_title = s.get("title")
+            body = s.get("body", "")
+            # skip extremely short slides (should have already merged but double-check)
+            if slug_title is None and len(body.strip()) < MIN_SLIDE_CHARS:
+                print("[SKIP] skipping tiny slide:", body[:40])
                 continue
-            # cap
-            if len(to_speak) > MAX_SLIDE_CHARS:
-                to_speak = to_speak[:MAX_SLIDE_CHARS].rsplit(" ",1)[0] + "..."
-            audio_file = os.path.join(base_dir, f"slide_{idx}.mp3")
-            ok = await synthesize_slide_tts(to_speak, audio_file)
-            if not ok:
-                # fallback silent
-                log(f"[WARN] TTS failed for slide {idx}, creating small silent mp3.")
-                # create silent mp3 using ffmpeg via moviepy is heavy; as fallback, create tiny TTS of '.' so there is an audio file
-                _ = await synthesize_slide_tts(".", audio_file)
-            slide_audios.append(audio_file)
 
-        # 6. create clips (ImageClip + set_audio using each slide's audio duration + padding)
-        clips = []
-        for idx, (img_p, aud_p) in enumerate(zip(slide_images, slide_audios)):
-            # get audio duration using AudioFileClip
-            audio_clip = None
-            try:
-                audio_clip = AudioFileClip(aud_p)
-                audio_dur = audio_clip.duration
-            except Exception as e:
-                log("[WARN] could not load audio clip, defaulting to 4s:", e)
-                audio_dur = 4.0
-            duration = max(3.5, audio_dur + PADDING_PER_SLIDE)
-            img_clip = make_zoomed_imageclip(img_p, duration)
-            # fade
-            img_clip = fadein(img_clip, FADE_DURATION)
-            img_clip = fadeout(img_clip, FADE_DURATION)
-            # set audio
-            try:
-                aclip = AudioFileClip(aud_p)
-                # pad audio if shorter than duration
-                if aclip.duration < duration:
-                    # create silence using numpy? simpler: keep audio as-is; video duration will be duration, moviepy will handle mismatch
-                    pass
-                img_clip = img_clip.set_audio(aclip)
-            except Exception as e:
-                log("[WARN] set audio failed for slide", idx, e)
-            clips.append(img_clip)
+            # image path
+            img_path = os.path.join(base, f"slide_img_{idx}.jpg")
+            # render text on top of the pre-made gradient background: we will composite bg+text
+            # approach: open bg_gradient_path, paste text image on top
+            rendered_text_img = os.path.join(base, f"slide_text_{idx}.png")
+            render_text_image(slug_title, body, rendered_text_img, title_font_size=86, body_font_size=44)
 
-        if not clips:
-            log("[CRITICAL] no clips created.")
+            # composite bg + rendered text centered
+            bg = Image.open(bg_gradient_path).convert("RGB")
+            overlay = Image.open(rendered_text_img).convert("RGBA")
+            bg.paste(overlay, (0,0), overlay)
+            bg.save(img_path, quality=92)
+
+            slide_image_paths.append(img_path)
+
+            # tts audio file
+            to_read = slug_title if slug_title else body
+            if not to_read or len(to_read.strip()) == 0:
+                # create a short silent mp3
+                silent_path = os.path.join(base, f"slide_silent_{idx}.mp3")
+                from moviepy.audio.AudioClip import AudioClip
+                silence = AudioClip(lambda t: 0*t, duration=2.5).set_fps(44100)
+                silence.write_audiofile(silent_path, fps=44100, codec="mp3", verbose=False, logger=None)
+                slide_audio_paths.append(silent_path)
+            else:
+                audio_path = os.path.join(base, f"slide_audio_{idx}.mp3")
+                await synthesize_slide_tts(to_read, audio_path)
+                slide_audio_paths.append(audio_path)
+
+        if not slide_image_paths:
+            print("[CRITICAL] No slide images created; exiting.")
             sys.exit(1)
 
-        # 7. concatenate (method compose keeps size)
-        final = concatenate_videoclips(clips, method="compose")
+        # create clips
+        clips=[]
+        total = len(slide_image_paths)
+        for idx, (img_p, aud_p) in enumerate(zip(slide_image_paths, slide_audio_paths)):
+            clip = create_slide_clip_from_image(img_p, aud_p, idx, total)
+            clips.append(clip)
 
-        # 8. write file
-        log(f"[*] Writing final video to {out_path} ...")
-        final.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac", preset="medium", threads=4, ffmpeg_params=["-movflags"," +faststart"])
-        log("[SUCCESS] Video saved:", out_path)
+        final = concatenate_videoclips(clips, method="compose")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        final.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac", preset="medium", threads=4, ffmpeg_params=["-movflags","+faststart"])
+        print("[SUCCESS] Video created:", out_path)
 
     except Exception as e:
-        log("[FATAL] Error during generation:", e)
+        print("[FATAL]", e)
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # cleanup temp slide images and audios
-        try:
-            for fname in os.listdir(base_dir):
-                if fname.startswith("slide_") and (fname.endswith(".png") or fname.endswith(".mp3")):
-                    try: os.remove(os.path.join(base_dir, fname))
-                    except: pass
-            if os.path.exists(bg_file):
-                try: os.remove(bg_file)
+        # cleanup temp files created in repo root
+        for fname in os.listdir(base):
+            if fname.startswith("slide_img_") or fname.startswith("slide_text_") or fname.startswith("slide_audio_") or fname.startswith("slide_silent_") or fname.startswith("temp_bg"):
+                try: os.remove(os.path.join(base, fname))
                 except: pass
-        except Exception:
-            pass
-
-# small helper to create silent audio (used earlier only if needed)
-def make_silent_audio(duration):
-    """
-    Create a temporary silent audio file path using ffmpeg would be ideal.
-    But moviepy AudioClip requires a function; we avoided heavy usage.
-    If needed later refine.
-    """
-    # Not used in main flow - kept for future
-    return None
 
 if __name__ == "__main__":
     asyncio.run(main())
