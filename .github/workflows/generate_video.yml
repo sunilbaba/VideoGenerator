@@ -1,48 +1,32 @@
 name: Generate Video (CI)
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      # -------------------------------
-      # 1. Checkout Repository
-      # -------------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # -------------------------------
-      # 2. Set up Python
-      # -------------------------------
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+      - name: Show python & pip (debug)
+        run: |
+          python --version
+          pip --version
 
-      # -------------------------------
-      # 3. Install System Dependencies
-      # Fixes MoviePy + ImageMagick errors
-      # -------------------------------
-      - name: Install system packages (ffmpeg, ImageMagick, fonts)
+      - name: Install system packages (ffmpeg, fonts)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg imagemagick fonts-dejavu-core
-          
-          # Fix ImageMagick security policy blocking "convert"
-          sudo sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml
-          sudo sed -i 's/rights="none" pattern="PS"/rights="read|write" pattern="PS"/' /etc/ImageMagick-6/policy.xml
-          sudo sed -i 's/rights="none" pattern="EPS"/rights="read|write" pattern="EPS"/' /etc/ImageMagick-6/policy.xml
-          sudo sed -i 's/rights="none" pattern="XPS"/rights="read|write" pattern="XPS"/' /etc/ImageMagick-6/policy.xml
+          # ffmpeg for moviepy; fonts so PIL can load DejaVuSans
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-dejavu-extra
+          # optional utilities (keep small)
+          sudo apt-get install -y libsndfile1
 
-      # -------------------------------
-      # 4. Cache pip
-      # -------------------------------
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -51,29 +35,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # -------------------------------
-      # 5. Install Python Dependencies
-      # -------------------------------
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # -------------------------------
-      # 6. Export Secrets (Optional)
-      # -------------------------------
-      - name: Export optional secrets (safe check)
+      - name: Print env secrets presence
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
         run: |
-          echo "HF_TOKEN set? -> ${HF_TOKEN:+YES}"
-          echo "UNSPLASH_ACCESS_KEY set? -> ${UNSPLASH_ACCESS_KEY:+YES}"
-          echo "FFMPEG binary: $(which ffmpeg)"
+          echo "HF_TOKEN present? -> ${HF_TOKEN:+YES}"
+          echo "UNSPLASH_ACCESS_KEY present? -> ${UNSPLASH_ACCESS_KEY:+YES}"
 
-      # -------------------------------
-      # 7. Run Script
-      # -------------------------------
       - name: Run generator script
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
@@ -81,12 +55,9 @@ jobs:
         run: |
           python main.py
 
-      # -------------------------------
-      # 8. Upload Output Video
-      # -------------------------------
       - name: Upload Video as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Generated-Video
+          name: Generated-Short-Video
           path: generated_videos/*.mp4
           if-no-files-found: warn
