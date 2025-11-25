@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -15,7 +16,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -35,12 +36,20 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
         run: |
-          echo "HF_TOKEN set: ${HF_TOKEN:+yes}"
-          echo "UNSPLASH_ACCESS_KEY set: ${UNSPLASH_ACCESS_KEY:+yes}"
+          echo "HF_TOKEN present? -> ${HF_TOKEN:+YES}"
+          echo "UNSPLASH_ACCESS_KEY present? -> ${UNSPLASH_ACCESS_KEY:+YES}"
 
-      - name: Run generator
+      - name: Run generator script
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
         run: |
           python main.py
+
+      # --- NEW STEP: ADDS DOWNLOAD BUTTON ---
+      - name: Upload Video as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-Short-Video
+          path: generated_videos/*.mp4
+          if-no-files-found: warn
