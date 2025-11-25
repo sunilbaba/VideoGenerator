@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Full generator script with robust image generation pipeline:
- - Hugging Face Inference API (if HF_TOKEN set)
- - Pollinations (free)
- - Unsplash API search (if UNSPLASH_ACCESS_KEY set)
- - Guaranteed FALLBACK_IMAGES (final fallback)
+Video generator script WITHOUT Pollinations (removed).
+Pipeline:
+ - Try multiple Hugging Face inference models (if HF_TOKEN set)
+ - Try Unsplash search (if UNSPLASH_ACCESS_KEY set)
+ - Fall back to guaranteed FALLBACK_IMAGES
 
-Requirements (example):
-pip install yfinance edge-tts moviepy pillow deep-translator mplfinance pandas requests
+Make sure to set optional env secrets:
+ - HF_TOKEN (Hugging Face token) -- optional but recommended
+ - UNSPLASH_ACCESS_KEY -- optional but recommended for reliable images
 """
 
 import os
@@ -19,7 +20,7 @@ import time
 import urllib.parse
 import traceback
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- LIBRARIES ---
 import yfinance as yf
@@ -86,12 +87,10 @@ def generate_technical_chart(ticker, name, filename):
             print("   [WARN] Empty dataframe from yfinance.", flush=True)
             return False
 
-        # Calculate Moving Averages
         df['SMA_50'] = df['Close'].rolling(window=50).mean()
         df['SMA_200'] = df['Close'].rolling(window=200).mean()
         df_plot = df.tail(120)
 
-        # Chart Style
         mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
         s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
         add_plots = [
@@ -99,7 +98,6 @@ def generate_technical_chart(ticker, name, filename):
             mpf.make_addplot(df_plot['SMA_200'], color='orange', width=2, panel=0)
         ]
 
-        # Save Chart
         mpf.plot(
             df_plot, type='candle', style=s, addplot=add_plots,
             title=f"\n{name} - Technical Analysis", ylabel='Price (INR)', volume=True,
@@ -194,10 +192,107 @@ def get_market_analysis_data():
         return None
 
 # ==========================================
-# 3. ROBUST VISUAL GENERATION PIPELINE
+# 3. ROBUST VISUAL GENERATION PIPELINE (NO POLLINATIONS)
 # ==========================================
+HF_MODEL_CANDIDATES = [
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    "stabilityai/stable-diffusion-xl-refiner-1.0",
+    "stabilityai/stable-diffusion-3-medium",
+    "runwayml/stable-diffusion-v1-5"
+]
+
+def _try_hf_models(prompt, filename):
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("   [INFO] HF_TOKEN not set; skipping Hugging Face attempts.", flush=True)
+        return False
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"}
+    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
+
+    for model in HF_MODEL_CANDIDATES:
+        model_url = f"https://api-inference.huggingface.co/models/{model}"
+        print(f"   [HF] Trying model: {model}", flush=True)
+        try:
+            def call_model():
+                resp = requests.post(model_url, headers=headers, json=payload, timeout=50)
+                # For server errors allow retries by raising
+                if resp.status_code >= 500:
+                    resp.raise_for_status()
+                return resp
+            resp = _retry_request(call_model, retries=2, backoff=2)
+        except Exception as e:
+            print(f"     [HF] network/server error for {model}: {e}", flush=True)
+            continue
+
+        status = getattr(resp, "status_code", None)
+        try:
+            text_snippet = resp.text[:400]
+        except Exception:
+            text_snippet = "<no-text>"
+
+        if status == 200:
+            ctype = resp.headers.get("Content-Type", "")
+            if ctype and ctype.startswith("image/"):
+                with open(filename, "wb") as f:
+                    f.write(resp.content)
+                print(f"   [SUCCESS] Hugging Face image from {model}", flush=True)
+                return True
+            else:
+                print(f"   [HF] Unexpected Content-Type {ctype} from {model}; response body: {text_snippet}", flush=True)
+                continue
+
+        if status in (410, 403, 404):
+            print(f"   [HF] Model {model} returned {status}. Likely gated/removed or token lacks access. Response: {text_snippet}", flush=True)
+            continue
+
+        print(f"   [HF] Model {model} returned status {status}. Response: {text_snippet}", flush=True)
+    return False
+
+def _try_unsplash(prompt, filename):
+    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if not unsplash_key:
+        print("   [INFO] UNSPLASH_ACCESS_KEY not set; skipping Unsplash attempts.", flush=True)
+        return False
+
+    print("   [Unsplash] Searching Unsplash...", flush=True)
+    try:
+        q = urllib.parse.quote_plus(prompt or "stock market")
+        search_url = f"https://api.unsplash.com/search/photos?query={q}&orientation=portrait&per_page=10"
+        headers = {"Authorization": f"Client-ID {unsplash_key}", "Accept-Version": "v1"}
+        def call_search():
+            r = requests.get(search_url, headers=headers, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        j = _retry_request(call_search, retries=2, backoff=1.5)
+        results = j.get("results", []) if isinstance(j, dict) else []
+        if not results:
+            print("   [Unsplash] No results returned.", flush=True)
+            return False
+        photo = random.choice(results)
+        img_url = photo.get("urls", {}).get("regular") or photo.get("urls", {}).get("full")
+        if not img_url:
+            print("   [Unsplash] Result missing urls.", flush=True)
+            return False
+        def call_img():
+            r2 = requests.get(img_url, timeout=30)
+            r2.raise_for_status()
+            return r2
+        r2 = _retry_request(call_img, retries=2, backoff=1)
+        ctype = r2.headers.get("Content-Type", "")
+        if not ctype or not ctype.startswith("image/"):
+            print(f"   [Unsplash] Image request returned non-image Content-Type: {ctype}", flush=True)
+            return False
+        with open(filename, "wb") as f:
+            f.write(r2.content)
+        print("   [SUCCESS] Image downloaded from Unsplash.", flush=True)
+        return True
+    except Exception as e:
+        print(f"   [WARN] Unsplash search failed: {e}", flush=True)
+        return False
+
 def get_visuals_robust(data, filename):
-    # 1. IF TECHNICAL MODE: Try to generate a Real Chart first
+    # 1) If technical: try to generate a real chart first
     if data.get('type') == 'technical':
         chart_filename = filename.replace(".jpg", "_chart.jpg")
         if generate_technical_chart(data['ticker'], data['name'], chart_filename):
@@ -210,96 +305,16 @@ def get_visuals_robust(data, filename):
         with open(path, "wb") as f:
             f.write(bytes_data)
 
-    # 2. ATTEMPT: Hugging Face API (Needs HF_TOKEN)
-    token = os.environ.get("HF_TOKEN")
-    if token:
-        print("   [Attempt 1] Hugging Face (Stable Diffusion XL)...", flush=True)
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"}
-        hf_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
-        payload = {"inputs": data.get('prompt', ''), "options": {"wait_for_model": True}}
-        try:
-            def call_hf():
-                resp = requests.post(hf_url, headers=headers, json=payload, timeout=60)
-                resp.raise_for_status()
-                ctype = resp.headers.get("Content-Type", "")
-                if ctype and ctype.startswith("image/"):
-                    return resp.content
-                # Sometimes HF returns JSON with base64-encoded image fields -> try to parse
-                try:
-                    j = resp.json()
-                    # look for base64 fields (heuristic)
-                    for k, v in j.items():
-                        if isinstance(v, str) and len(v) > 100 and all(ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n" for ch in v[:10]):
-                            try:
-                                return base64.b64decode(v)
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-                raise ValueError(f"Hugging Face returned non-image content-type: {ctype}")
-            img_bytes = _retry_request(call_hf, retries=2, backoff=2)
-            save_bytes_to_file(img_bytes, filename)
-            print("   [SUCCESS] Image generated via Hugging Face.", flush=True)
-            return True
-        except Exception as e:
-            print(f"   [WARN] Hugging Face Error: {e}", flush=True)
-
-    # 3. ATTEMPT: Pollinations API (Backup AI)
-    print("   [Attempt 2] Pollinations API (Flux)...", flush=True)
-    try:
-        poll_prompt = urllib.parse.quote(data.get('prompt', 'stock market'))
-        poll_url = f"https://image.pollinations.ai/prompt/{poll_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&model=flux&nologo=true"
-        headers = {"Accept": "image/*,application/octet-stream"}
-        def call_poll():
-            resp = requests.get(poll_url, headers=headers, timeout=45)
-            resp.raise_for_status()
-            ctype = resp.headers.get("Content-Type", "")
-            if not ctype or not ctype.startswith("image/"):
-                raise ValueError(f"Pollinations returned Content-Type={ctype}")
-            return resp.content
-        img_bytes = _retry_request(call_poll, retries=3, backoff=1.5)
-        save_bytes_to_file(img_bytes, filename)
-        print("   [SUCCESS] Image generated via Pollinations.", flush=True)
+    # 2) Try HF models (if HF_TOKEN)
+    if _try_hf_models(data.get('prompt', ''), filename):
         return True
-    except Exception as e:
-        print(f"   [WARN] Pollinations failed: {e}", flush=True)
 
-    # 4. ATTEMPT: Unsplash API (Search & hotlink) - optional but more reliable than random external images
-    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if unsplash_key:
-        print("   [Attempt 3] Unsplash search fallback...", flush=True)
-        try:
-            q = urllib.parse.quote_plus(data.get('name', data.get('prompt', 'stock market')))
-            search_url = f"https://api.unsplash.com/search/photos?query={q}&orientation=portrait&per_page=10"
-            headers = {"Authorization": f"Client-ID {unsplash_key}", "Accept-Version": "v1"}
-            def call_unsplash():
-                r = requests.get(search_url, headers=headers, timeout=20)
-                r.raise_for_status()
-                j = r.json()
-                results = j.get("results", [])
-                if not results:
-                    raise ValueError("Unsplash returned no results")
-                photo = random.choice(results)
-                img_url = photo.get("urls", {}).get("regular") or photo.get("urls", {}).get("full")
-                if not img_url:
-                    raise ValueError("Unsplash result missing urls")
-                r2 = requests.get(img_url, timeout=30)
-                r2.raise_for_status()
-                ctype = r2.headers.get("Content-Type", "")
-                if not ctype or not ctype.startswith("image/"):
-                    raise ValueError("Unsplash image request returned non-image")
-                return r2.content
-            img_bytes = _retry_request(call_unsplash, retries=2, backoff=1.5)
-            save_bytes_to_file(img_bytes, filename)
-            print("   [SUCCESS] Image downloaded from Unsplash.", flush=True)
-            return True
-        except Exception as e:
-            print(f"   [WARN] Unsplash search failed: {e}", flush=True)
-    else:
-        print("   [INFO] UNSPLASH_ACCESS_KEY not set — skipping Unsplash search fallback.", flush=True)
+    # 3) Try Unsplash (search)
+    if _try_unsplash(data.get('name') or data.get('prompt', ''), filename):
+        return True
 
-    # 5. FINAL FALLBACK: GUARANTEED FALLBACK_IMAGES
-    print("   [Attempt 4] Downloading Guaranteed Stock Image...", flush=True)
+    # 4) Final fallback images
+    print("   [Fallback] Trying guaranteed FALLBACK_IMAGES ...", flush=True)
     for attempt in range(len(FALLBACK_IMAGES)):
         try:
             url = random.choice(FALLBACK_IMAGES)
@@ -343,14 +358,11 @@ def render_video(image_path, audio_path, output_path):
         img_clip = ImageClip(image_path).set_duration(duration)
         img_w, img_h = img_clip.size
 
-        # Logic to handle both square charts and portrait images
-        if img_w > img_h:  # It's a chart
+        if img_w > img_h:
             img_clip = img_clip.resize(width=1080)
             img_clip = img_clip.set_position("center")
-        else:  # It's a portrait image
-            # robust resize while preserving aspect ratio; then center crop if needed
+        else:
             img_clip = img_clip.resize(height=RESIZE_DIM[1])
-            # position movement (subtle pan)
             if VIDEO_MODE == "PORTRAIT":
                 img_clip = img_clip.set_position(lambda t: ('center', -50 - (t * 20)))
             else:
@@ -359,7 +371,6 @@ def render_video(image_path, audio_path, output_path):
         final = CompositeVideoClip([img_clip], size=RESOLUTION)
         final = final.set_audio(audio_clip)
 
-        # ensure output folder exists
         out_dir = os.path.dirname(output_path)
         if out_dir and not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
@@ -385,7 +396,6 @@ async def main():
     audio_path = os.path.join(base_dir, "temp_voice.mp3")
 
     try:
-        # 1. Get Data (News or Technicals)
         data = get_trending_stock()
         if not data:
             data = get_market_analysis_data()
@@ -397,17 +407,14 @@ async def main():
         final_filename = f"{data['title']}_{timestamp}.mp4"
         output_path = os.path.join(base_dir, OUTPUT_FOLDER, final_filename)
 
-        # 2. Generate Visuals (With 4-Layer Fallback)
         if not get_visuals_robust(data, img_path):
             print("[CRITICAL] All visual generation methods failed.", flush=True)
             sys.exit(1)
 
-        # 3. Generate Audio
         if not await generate_audio_telugu(data['script'], audio_path):
             print("[CRITICAL] Audio generation failed.", flush=True)
             sys.exit(1)
 
-        # 4. Render Video
         if render_video(img_path, audio_path, output_path):
             print(f"\n[SUCCESS] Video Saved: {output_path}", flush=True)
         else:
@@ -419,7 +426,6 @@ async def main():
         sys.exit(1)
 
     finally:
-        # Cleanup temp files
         try:
             if os.path.exists(img_path):
                 os.remove(img_path)
