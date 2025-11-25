@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Video generator script WITHOUT Pollinations (removed).
-Pipeline:
- - Try multiple Hugging Face inference models (if HF_TOKEN set)
- - Try Unsplash search (if UNSPLASH_ACCESS_KEY set)
- - Fall back to guaranteed FALLBACK_IMAGES
-
-Make sure to set optional env secrets:
- - HF_TOKEN (Hugging Face token) -- optional but recommended
- - UNSPLASH_ACCESS_KEY -- optional but recommended for reliable images
+Slides video generator (per-slide TTS) with:
+ - Smooth transitions (A): 0.8s fade-in/out, gentle slide-up
+ - Per-slide TTS (edge-tts) in Telugu
+ - Skip/merge very short slides
+ - Dark gradient overlay for readability
+ - Company logo watermark (configurable path & opacity)
+ - Outputs to generated_videos/
 """
 
 import os
@@ -19,34 +17,51 @@ import asyncio
 import time
 import urllib.parse
 import traceback
-import base64
 from datetime import datetime
+from io import BytesIO
 
-# --- LIBRARIES ---
+# third-party libraries
 import yfinance as yf
 import edge_tts
 from moviepy.editor import *
-from PIL import Image
+from moviepy.video.fx.all import resize
+from PIL import Image, ImageDraw
 from deep_translator import GoogleTranslator
+from bs4 import BeautifulSoup
 
-# --- CHARTING ---
-import mplfinance as mpf
-import pandas as pd
-
-# --- CONFIGURATION ---
+# ---------------- CONFIG ----------------
 OUTPUT_FOLDER = "generated_videos"
-VIDEO_MODE = "PORTRAIT"
+VIDEO_MODE = "PORTRAIT"   # PORTRAIT or LANDSCAPE
 
 if VIDEO_MODE == "PORTRAIT":
     RESOLUTION = (1080, 1920)
-    RESIZE_DIM = (1920, 3415)
 else:
     RESOLUTION = (1920, 1080)
-    RESIZE_DIM = (3415, 1920)
 
 VOICE = "te-IN-ShrutiNeural"
 
-# --- GUARANTEED FALLBACK IMAGES (High-Quality Stock) ---
+# slide text sizing / thresholds
+MIN_SLIDE_CHARS = 40
+MAX_SLIDE_CHARS = 1200
+
+# Transition style A (Very smooth)
+FADE_DURATION = 0.8      # seconds (fade-in and fade-out)
+SLIDE_UP_PIXELS = 60     # total upward motion across slide duration (gentle)
+PADDING_PER_SLIDE = 0.35 # extra seconds padding per slide
+
+# Ken Burns (subtle zoom)
+ZOOM_FACTOR = 0.04       # 4% zoom over slide duration
+
+# logo watermark settings
+LOGO_PATH_ENV = os.environ.get("LOGO_PATH", "")  # optional override via env
+DEFAULT_LOGO_PATH = "assets/logo.png"            # default location in repo
+LOGO_OPACITY = 0.65      # 0..1
+LOGO_SCALE = 0.18        # fraction of width for logo (approx)
+
+# dark gradient overlay (top->transparent->bottom) parameters
+GRADIENT_TOP_ALPHA = 0.55   # opacity at top (0..1)
+GRADIENT_BOTTOM_ALPHA = 0.35
+
 FALLBACK_IMAGES = [
     "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=1080&h=1920&fit=crop",
     "https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=1080&h=1920&fit=crop",
@@ -54,16 +69,13 @@ FALLBACK_IMAGES = [
     "https://images.unsplash.com/photo-1642543492481-44e81e3914a7?q=80&w=1080&h=1920&fit=crop"
 ]
 
-# --- STOCK LIST ---
 WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
     "HINDUNILVR.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS",
     "LICI.NS", "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS"
 ]
 
-# -----------------------
-# Helper: retry with backoff
-# -----------------------
+# ---------------- util ----------------
 def _retry_request(func, retries=3, backoff=1.5):
     last_exc = None
     for i in range(retries):
@@ -72,365 +84,433 @@ def _retry_request(func, retries=3, backoff=1.5):
         except Exception as e:
             last_exc = e
             sleep_t = backoff * (2 ** i)
-            print(f"   [RETRY] attempt {i+1}/{retries} failed: {e} — sleeping {sleep_t:.1f}s", flush=True)
+            print(f"[RETRY] attempt {i+1}/{retries} failed: {e} — sleeping {sleep_t:.1f}s", flush=True)
             time.sleep(sleep_t)
     raise last_exc
 
-# ==========================================
-# 1. TECHNICAL CHART GENERATOR
-# ==========================================
-def generate_technical_chart(ticker, name, filename):
-    print(f"[*] Generating Technical Chart for {name}...", flush=True)
-    try:
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
-        if df.empty:
-            print("   [WARN] Empty dataframe from yfinance.", flush=True)
-            return False
-
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
-        df['SMA_200'] = df['Close'].rolling(window=200).mean()
-        df_plot = df.tail(120)
-
-        mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
-        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
-        add_plots = [
-            mpf.make_addplot(df_plot['SMA_50'], color='cyan', width=2, panel=0),
-            mpf.make_addplot(df_plot['SMA_200'], color='orange', width=2, panel=0)
-        ]
-
-        mpf.plot(
-            df_plot, type='candle', style=s, addplot=add_plots,
-            title=f"\n{name} - Technical Analysis", ylabel='Price (INR)', volume=True,
-            savefig=dict(fname=filename, dpi=150, bbox_inches='tight'),
-            figratio=(9, 10), figscale=1.2
-        )
-        print("   [SUCCESS] Chart saved.", flush=True)
-        return True
-    except Exception as e:
-        print(f"   [ERROR] Chart generation failed: {e}", flush=True)
-        traceback.print_exc()
-        return False
-
-# ==========================================
-# 2. DATA SOURCE: NEWS & TECHNICALS
-# ==========================================
+# ---------------- pick topic ----------------
 def get_trending_stock():
-    print("[*] Scanning Market for Fresh News...", flush=True)
     random.shuffle(WATCHLIST)
     for ticker in WATCHLIST[:15]:
         try:
             stock = yf.Ticker(ticker)
             news = getattr(stock, "news", None) or []
             if news and len(news) > 0:
-                print(f" [!] Checking News for {ticker}...", flush=True)
-                latest_news = news[0]
-                title = latest_news.get('title', 'Market Update')
-                publisher = latest_news.get('publisher', 'News Source')
-                if len(title) < 5:
-                    continue
-
+                latest = news[0]
+                title = latest.get('title', 'Market Update')
+                publisher = latest.get('publisher', 'News Source')
+                link = latest.get('link') or latest.get('url')
                 info = getattr(stock, "info", {}) or {}
                 name = info.get('shortName', ticker)
                 price = info.get('currentPrice', 0)
                 mcap = int(info.get('marketCap', 0) / 10000000) if info.get('marketCap') else 0
-
-                print(f" [SUCCESS] Locked in: {ticker}", flush=True)
-                english_script = (
-                    f"Breaking Stock Market Update! Let's talk about {name}. "
-                    f"The stock is currently trading at {price} rupees. "
-                    f"According to {publisher}, reports say: {title}. "
-                    f"With a market valuation of {mcap} crore rupees, this is a key level to watch. "
-                    "Stay subscribed for more Indian market updates."
-                )
-                return {
-                    "type": "news",
-                    "title": f"News_{ticker}",
-                    "script": english_script,
-                    "prompt": f"cinematic shot of {name} building, stock market graph, 8k",
-                    "ticker": ticker,
-                    "name": name
-                }
+                script = f"Breaking update on {name}. Price: {price} rupees. {title}. Market cap approx {mcap} crore."
+                return {"type":"news","title":f"News_{ticker}","name":name,"script":script,"article_link":link}
         except Exception as e:
-            print(f"   [WARN] news check failed for {ticker}: {e}", flush=True)
+            print(f"[WARN] get_trending_stock error for {ticker}: {e}", flush=True)
             continue
     return None
 
 def get_market_analysis_data():
-    print("[!] No stock news found. Switching to Market Technical Analysis...", flush=True)
-    indices = [{"ticker": "^NSEI", "name": "Nifty 50"}, {"ticker": "^NSEBANK", "name": "Bank Nifty"}]
+    indices = [{"ticker":"^NSEI","name":"Nifty 50"},{"ticker":"^NSEBANK","name":"Bank Nifty"}]
     target = random.choice(indices)
     try:
         stock = yf.Ticker(target['ticker'])
         hist = stock.history(period="1mo")
         if hist.shape[0] < 2:
-            raise ValueError("Not enough history rows")
-        current_price = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2]
-        change = current_price - prev_close
-        pct_change = (change / prev_close) * 100
-        trend = "bullish" if current_price > prev_close else "bearish"
-
-        script = (
-            f"Market Analysis Report for {target['name']}. "
-            f"The index is currently trading at {int(current_price)} points. "
-            f"Today, we see a {trend} move of {abs(int(change))} points, which is {abs(round(pct_change, 2))} percent. "
-            "Technically, the chart shows strong support at lower levels. "
-            "Watch the 50-day moving average carefully for the next breakout. "
-            "Stay tuned for more technical updates."
-        )
-        return {
-            "type": "technical",
-            "title": f"Technical_{target['name'].replace(' ', '_')}",
-            "ticker": target['ticker'],
-            "name": target['name'],
-            "script": script,
-            "prompt": f"stock market chart background, {target['name']}, financial lines, 8k"
-        }
+            raise ValueError("Not enough history")
+        curr = hist['Close'].iloc[-1]
+        prev = hist['Close'].iloc[-2]
+        change = curr - prev
+        pct = (change / prev) * 100
+        trend = "bullish" if change > 0 else "bearish"
+        script = f"{target['name']} shows a {trend} move of {abs(round(pct,2))}% today at {int(curr)} points."
+        return {"type":"technical","title":f"Technical_{target['name']}","name":target['name'],"script":script,"article_link":None}
     except Exception as e:
-        print(f"   [FAIL] Market Analysis failed: {e}", flush=True)
-        traceback.print_exc()
+        print(f"[ERROR] market analysis failed: {e}", flush=True)
         return None
 
-# ==========================================
-# 3. ROBUST VISUAL GENERATION PIPELINE (NO POLLINATIONS)
-# ==========================================
-HF_MODEL_CANDIDATES = [
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "stabilityai/stable-diffusion-xl-refiner-1.0",
-    "stabilityai/stable-diffusion-3-medium",
-    "runwayml/stable-diffusion-v1-5"
-]
-
-def _try_hf_models(prompt, filename):
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        print("   [INFO] HF_TOKEN not set; skipping Hugging Face attempts.", flush=True)
-        return False
-
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"}
-    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
-
-    for model in HF_MODEL_CANDIDATES:
-        model_url = f"https://api-inference.huggingface.co/models/{model}"
-        print(f"   [HF] Trying model: {model}", flush=True)
-        try:
-            def call_model():
-                resp = requests.post(model_url, headers=headers, json=payload, timeout=50)
-                # For server errors allow retries by raising
-                if resp.status_code >= 500:
-                    resp.raise_for_status()
-                return resp
-            resp = _retry_request(call_model, retries=2, backoff=2)
-        except Exception as e:
-            print(f"     [HF] network/server error for {model}: {e}", flush=True)
-            continue
-
-        status = getattr(resp, "status_code", None)
-        try:
-            text_snippet = resp.text[:400]
-        except Exception:
-            text_snippet = "<no-text>"
-
-        if status == 200:
-            ctype = resp.headers.get("Content-Type", "")
-            if ctype and ctype.startswith("image/"):
-                with open(filename, "wb") as f:
-                    f.write(resp.content)
-                print(f"   [SUCCESS] Hugging Face image from {model}", flush=True)
-                return True
-            else:
-                print(f"   [HF] Unexpected Content-Type {ctype} from {model}; response body: {text_snippet}", flush=True)
-                continue
-
-        if status in (410, 403, 404):
-            print(f"   [HF] Model {model} returned {status}. Likely gated/removed or token lacks access. Response: {text_snippet}", flush=True)
-            continue
-
-        print(f"   [HF] Model {model} returned status {status}. Response: {text_snippet}", flush=True)
-    return False
-
-def _try_unsplash(prompt, filename):
-    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if not unsplash_key:
-        print("   [INFO] UNSPLASH_ACCESS_KEY not set; skipping Unsplash attempts.", flush=True)
-        return False
-
-    print("   [Unsplash] Searching Unsplash...", flush=True)
+# ---------------- scrape ----------------
+def fetch_article_text(url):
+    if not url:
+        return None
     try:
-        q = urllib.parse.quote_plus(prompt or "stock market")
-        search_url = f"https://api.unsplash.com/search/photos?query={q}&orientation=portrait&per_page=10"
-        headers = {"Authorization": f"Client-ID {unsplash_key}", "Accept-Version": "v1"}
-        def call_search():
-            r = requests.get(search_url, headers=headers, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        j = _retry_request(call_search, retries=2, backoff=1.5)
-        results = j.get("results", []) if isinstance(j, dict) else []
-        if not results:
-            print("   [Unsplash] No results returned.", flush=True)
-            return False
-        photo = random.choice(results)
-        img_url = photo.get("urls", {}).get("regular") or photo.get("urls", {}).get("full")
-        if not img_url:
-            print("   [Unsplash] Result missing urls.", flush=True)
-            return False
-        def call_img():
-            r2 = requests.get(img_url, timeout=30)
-            r2.raise_for_status()
-            return r2
-        r2 = _retry_request(call_img, retries=2, backoff=1)
-        ctype = r2.headers.get("Content-Type", "")
-        if not ctype or not ctype.startswith("image/"):
-            print(f"   [Unsplash] Image request returned non-image Content-Type: {ctype}", flush=True)
-            return False
-        with open(filename, "wb") as f:
-            f.write(r2.content)
-        print("   [SUCCESS] Image downloaded from Unsplash.", flush=True)
-        return True
+        headers = {"User-Agent":"Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        paras = []
+        article = soup.find("article")
+        if article:
+            for p in article.find_all("p"):
+                t = p.get_text(strip=True)
+                if t:
+                    paras.append(t)
+        if not paras:
+            # pick largest div/section with many <p>
+            candidates = soup.find_all(["div","section"])
+            best = None
+            best_count = 0
+            for c in candidates:
+                ps = c.find_all("p")
+                if len(ps) > best_count:
+                    best_count = len(ps)
+                    best = c
+            if best and best_count > 0:
+                for p in best.find_all("p"):
+                    t = p.get_text(strip=True)
+                    if t:
+                        paras.append(t)
+        if not paras:
+            meta = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name":"description"})
+            if meta and meta.get("content"):
+                paras = [meta.get("content").strip()]
+        if not paras:
+            ps = soup.find_all("p")
+            for p in ps[:10]:
+                t = p.get_text(strip=True)
+                if t:
+                    paras.append(t)
+        if not paras:
+            return None
+        full = "\n\n".join(paras)
+        # limit to avoid huge videos
+        maxlen = MAX_SLIDE_CHARS * 10
+        if len(full) > maxlen:
+            full = full[:maxlen].rsplit(" ",1)[0] + "..."
+        return full
     except Exception as e:
-        print(f"   [WARN] Unsplash search failed: {e}", flush=True)
-        return False
+        print(f"[ERROR] fetch_article_text failed: {e}", flush=True)
+        return None
 
-def get_visuals_robust(data, filename):
-    # 1) If technical: try to generate a real chart first
-    if data.get('type') == 'technical':
-        chart_filename = filename.replace(".jpg", "_chart.jpg")
-        if generate_technical_chart(data['ticker'], data['name'], chart_filename):
-            if os.path.exists(filename):
-                os.remove(filename)
-            os.rename(chart_filename, filename)
-            return True
-
-    def save_bytes_to_file(bytes_data, path):
-        with open(path, "wb") as f:
-            f.write(bytes_data)
-
-    # 2) Try HF models (if HF_TOKEN)
-    if _try_hf_models(data.get('prompt', ''), filename):
-        return True
-
-    # 3) Try Unsplash (search)
-    if _try_unsplash(data.get('name') or data.get('prompt', ''), filename):
-        return True
-
-    # 4) Final fallback images
-    print("   [Fallback] Trying guaranteed FALLBACK_IMAGES ...", flush=True)
-    for attempt in range(len(FALLBACK_IMAGES)):
-        try:
-            url = random.choice(FALLBACK_IMAGES)
-            def call_fallback():
-                resp = requests.get(url, timeout=30)
-                resp.raise_for_status()
-                ctype = resp.headers.get("Content-Type", "")
-                if not ctype or not ctype.startswith("image/"):
-                    raise ValueError("Fallback URL not an image")
-                return resp.content
-            img_bytes = _retry_request(call_fallback, retries=2, backoff=1)
-            save_bytes_to_file(img_bytes, filename)
-            print("   [SUCCESS] Stock image downloaded.", flush=True)
-            return True
-        except Exception as e:
-            print(f"   [WARN] Fallback image attempt failed: {e}", flush=True)
-            continue
-
-    print("   [CRITICAL] All visual generation methods failed.", flush=True)
-    return False
-
-# --- AUDIO & RENDER ---
-async def generate_audio_telugu(text, filename):
-    print("[*] Translating & Generating Audio...", flush=True)
-    try:
-        telugu_text = GoogleTranslator(source='auto', target='te').translate(text)
-        communicate = edge_tts.Communicate(telugu_text, VOICE)
-        await communicate.save(filename)
-        return True
-    except Exception as e:
-        print(f"[ERROR] Audio failed: {e}", flush=True)
-        traceback.print_exc()
-        return False
-
-def render_video(image_path, audio_path, output_path):
-    print("[*] Rendering Video...", flush=True)
-    try:
-        audio_clip = AudioFileClip(audio_path)
-        duration = audio_clip.duration + 1.0
-
-        img_clip = ImageClip(image_path).set_duration(duration)
-        img_w, img_h = img_clip.size
-
-        if img_w > img_h:
-            img_clip = img_clip.resize(width=1080)
-            img_clip = img_clip.set_position("center")
+# ---------------- split + merge ----------------
+def split_text_into_slides(text, title=None, approx_chars=700):
+    if not text:
+        return []
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    slides = []
+    if title:
+        slides.append({"title": title, "body": ""})
+    cur = []
+    cur_len = 0
+    for p in paras:
+        p_len = len(p)
+        if cur_len + p_len + 2 <= approx_chars:
+            cur.append(p); cur_len += p_len + 2
         else:
-            img_clip = img_clip.resize(height=RESIZE_DIM[1])
-            if VIDEO_MODE == "PORTRAIT":
-                img_clip = img_clip.set_position(lambda t: ('center', -50 - (t * 20)))
+            slides.append({"title": None, "body": "\n\n".join(cur)})
+            cur = [p]; cur_len = p_len + 2
+    if cur:
+        slides.append({"title": None, "body": "\n\n".join(cur)})
+    # merge extremely short slides into previous
+    cleaned = []
+    for s in slides:
+        body = (s.get("body") or "").strip()
+        if len(body) < MIN_SLIDE_CHARS:
+            if cleaned:
+                prev = cleaned[-1]
+                prev_body = prev.get("body","")
+                prev["body"] = (prev_body + "\n\n" + body).strip()
             else:
-                img_clip = img_clip.set_position(lambda t: (-50 - (t * 20), 'center'))
+                # if first slide short, keep (title slide typically) or skip
+                cleaned.append(s)
+        else:
+            cleaned.append(s)
+    if len(cleaned) > 14:
+        return split_text_into_slides(text, title=title, approx_chars=1200)
+    return cleaned
 
-        final = CompositeVideoClip([img_clip], size=RESOLUTION)
-        final = final.set_audio(audio_clip)
-
-        out_dir = os.path.dirname(output_path)
-        if out_dir and not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
-
-        final.write_videofile(
-            output_path, fps=24, codec='libx264', audio_codec='aac', preset='medium', threads=4
-        )
+# ---------------- per-slide TTS ----------------
+async def synthesize_slide_tts(text, out_path):
+    try:
+        telugu = GoogleTranslator(source='auto', target='te').translate(text)
+        comm = edge_tts.Communicate(telugu, VOICE)
+        await comm.save(out_path)
         return True
     except Exception as e:
-        print(f"[ERROR] Render failed: {e}", flush=True)
+        print(f"[ERROR] synthesize_slide_tts failed: {e}", flush=True)
         traceback.print_exc()
         return False
 
-# ==========================================
-# 4. MAIN FLOW
-# ==========================================
+# ---------------- background + gradient + logo ----------------
+def download_background(path):
+    for url in FALLBACK_IMAGES:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200 and r.headers.get("Content-Type","").startswith("image/"):
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                return True
+        except Exception:
+            continue
+    # create plain dark
+    img = Image.new("RGB", RESOLUTION, (12, 12, 12))
+    img.save(path, quality=90)
+    return True
+
+def create_dark_gradient_overlay(path):
+    """Create a PNG gradient (same size as RESOLUTION) with alpha channel to overlay on top."""
+    w, h = RESOLUTION
+    base = Image.new("RGBA", (w, h), (0,0,0,0))
+    draw = ImageDraw.Draw(base)
+    # vertical gradient: top alpha -> middle transparent -> bottom alpha (subtle)
+    for y in range(h):
+        # compute alpha: stronger near top and bottom, lower at center
+        # normalized position 0..1
+        pos = y / (h-1)
+        # alpha curve: blend top and bottom influences
+        top_influence = max(0.0, 1.0 - (pos * 2.0))   # decreases from top
+        bottom_influence = max(0.0, 1.0 - ((1.0 - pos) * 2.0)) # increases toward bottom
+        # combine and scale using configured alphas
+        alpha = int(255 * (top_influence * GRADIENT_TOP_ALPHA + bottom_influence * GRADIENT_BOTTOM_ALPHA) / 2.0)
+        draw.line([(0,y),(w,y)], fill=(0,0,0,alpha))
+    base.save(path, format="PNG")
+    return True
+
+def load_logo_clip(logo_path):
+    try:
+        if not os.path.exists(logo_path):
+            return None
+        logo = Image.open(logo_path).convert("RGBA")
+        # determine target width
+        w, h = RESOLUTION
+        max_logo_w = int(w * LOGO_SCALE)
+        # scale preserving aspect ratio
+        aspect = logo.width / logo.height
+        new_w = max_logo_w
+        new_h = int(new_w / aspect)
+        logo = logo.resize((new_w, new_h), Image.LANCZOS)
+        # save a temporary file (logo_temp.png)
+        tmp = "logo_temp.png"
+        logo.save(tmp, format="PNG")
+        clip = ImageClip(tmp).set_duration(0.1)  # will be used as image clip; duration will be extended later per slide
+        clip = clip.set_opacity(LOGO_OPACITY)
+        return clip
+    except Exception as e:
+        print(f"[WARN] load_logo_clip failed: {e}", flush=True)
+        return None
+
+# ---------------- create slide clip ----------------
+def create_slide_clip(bg_path, gradient_path, logo_clip, slide, audio_path, idx, total):
+    # audio info -> duration
+    audio_clip = AudioFileClip(audio_path)
+    base_dur = audio_clip.duration
+    duration = max(2.5, base_dur + PADDING_PER_SLIDE)
+
+    # background base clip
+    bg = ImageClip(bg_path).set_duration(duration)
+
+    # Ken Burns zoom (subtle)
+    try:
+        zoom_clip = bg.resize(lambda t: 1.0 + ZOOM_FACTOR * (t / duration)).set_duration(duration)
+    except Exception:
+        zoom_clip = bg.set_duration(duration)
+
+    clips = [zoom_clip]
+
+    # overlay gradient PNG as ImageClip with same duration
+    grad_clip = ImageClip(gradient_path).set_duration(duration)
+    clips.append(grad_clip)
+
+    # text rendering (title card or body)
+    if slide.get("title"):
+        text = slide["title"]
+        fontsize = 78 if VIDEO_MODE=="PORTRAIT" else 60
+        txt = TextClip(text, fontsize=fontsize, font="DejaVu-Sans", color="white", method="label")
+        txt = txt.set_duration(duration)
+        # gentle slide-up: start slightly lower, end higher
+        y_start = int(RESOLUTION[1]*0.62)
+        y_end = int(RESOLUTION[1]*0.34)
+        def pos_title(t):
+            prog = min(1.0, t / duration)
+            y = int(y_start + (y_end - y_start) * prog)
+            x = (RESOLUTION[0] - txt.w) / 2
+            return (int(x), int(y))
+        txt = txt.set_position(pos_title)
+        clips.append(txt)
+    else:
+        body = slide.get("body","")
+        fontsize = 44 if VIDEO_MODE=="PORTRAIT" else 36
+        caption_w = RESOLUTION[0] - 120
+        body_clip = TextClip(body, fontsize=fontsize, font="DejaVu-Sans", method="caption", size=(caption_w, None), align="West", color="white")
+        body_clip = body_clip.set_duration(duration)
+        x = int((RESOLUTION[0] - caption_w) / 2)
+        y_start = int(RESOLUTION[1] * 0.62)
+        y_end = int(RESOLUTION[1] * 0.18)
+        def pos_body(t):
+            prog = min(1.0, t / duration)
+            y = int(y_start + (y_end - y_start) * prog)
+            return (x, y)
+        body_clip = body_clip.set_position(pos_body)
+        clips.append(body_clip)
+
+    # logo watermark: clone with same duration and position (bottom-left)
+    if logo_clip:
+        logo_dur = duration
+        # clone the logo clip and set duration & position bottom-left with margin
+        logo_c = logo_clip.set_duration(duration)
+        margin = 28
+        logo_c = logo_c.set_position((margin, RESOLUTION[1] - logo_c.h - margin))
+        clips.append(logo_c)
+
+    # footer slide counter small
+    footer_txt = f"{idx+1}/{total}"
+    footer_clip = TextClip(footer_txt, fontsize=26, font="DejaVu-Sans", color="white", method="label")
+    footer_clip = footer_clip.set_duration(duration).set_position(("right", RESOLUTION[1]-60))
+    clips.append(footer_clip)
+
+    comp = CompositeVideoClip(clips, size=RESOLUTION).set_duration(duration)
+
+    # apply fade-in/out (style A durations)
+    comp = comp.fx(vfx.fadein, FADE_DURATION).fx(vfx.fadeout, FADE_DURATION)
+
+    # set audio: pad silence if needed to match duration
+    if audio_clip.duration < duration:
+        silence = AudioClip(lambda t: 0*t, duration=(duration - audio_clip.duration)).set_fps(44100)
+        audio_final = concatenate_audioclips([audio_clip, silence])
+    else:
+        audio_final = audio_clip.subclip(0, duration)
+
+    comp = comp.set_audio(audio_final)
+    return comp
+
+# ---------------- main ----------------
 async def main():
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    base_dir = os.getcwd()
+    base = os.getcwd()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = os.path.join(base_dir, "temp_bg.jpg")
-    audio_path = os.path.join(base_dir, "temp_voice.mp3")
+    bg_path = os.path.join(base, "temp_bg.jpg")
+    grad_path = os.path.join(base, "temp_grad.png")
 
     try:
+        # pick topic
         data = get_trending_stock()
         if not data:
             data = get_market_analysis_data()
         if not data:
-            print("[CRITICAL] Could not fetch ANY data. Exiting.", flush=True)
-            sys.exit(1)
+            print("[CRITICAL] No data available", flush=True); sys.exit(1)
 
-        print(f"[*] Mode: {data['type'].upper()} | Topic: {data['name']}", flush=True)
-        final_filename = f"{data['title']}_{timestamp}.mp4"
-        output_path = os.path.join(base_dir, OUTPUT_FOLDER, final_filename)
+        title = data.get("name") or data.get("title")
+        final_filename = f"{data.get('title')}_{timestamp}.mp4"
+        out_path = os.path.join(base, OUTPUT_FOLDER, final_filename)
+        link = data.get("article_link")
 
-        if not get_visuals_robust(data, img_path):
-            print("[CRITICAL] All visual generation methods failed.", flush=True)
-            sys.exit(1)
+        # fetch article or fallback to script
+        article_text = None
+        if link and link.startswith("http"):
+            article_text = fetch_article_text(link)
+        if not article_text:
+            article_text = data.get("script") or f"{title} - Market update."
 
-        if not await generate_audio_telugu(data['script'], audio_path):
-            print("[CRITICAL] Audio generation failed.", flush=True)
-            sys.exit(1)
+        # split into slides, merge short
+        slides = split_text_into_slides(article_text, title=title, approx_chars=700)
+        if not slides:
+            slides = [{"title": title, "body": data.get("script","")}]
 
-        if render_video(img_path, audio_path, output_path):
-            print(f"\n[SUCCESS] Video Saved: {output_path}", flush=True)
+        print(f"[INFO] Created {len(slides)} slides", flush=True)
+
+        # prepare background+gradient
+        download_background(bg_path)
+        create_dark_gradient_overlay(grad_path)
+
+        # load logo clip (if available)
+        logo_path = LOGO_PATH_ENV if LOGO_PATH_ENV else DEFAULT_LOGO_PATH
+        logo_clip = load_logo_clip(logo_path) if os.path.exists(logo_path) else None
+        if logo_clip:
+            print(f"[INFO] Logo watermark loaded from {logo_path}", flush=True)
         else:
-            sys.exit(1)
+            print("[INFO] No logo found; continuing without watermark", flush=True)
+
+        # per-slide TTS generation
+        temp_audio_paths = []
+        for idx, slide in enumerate(slides):
+            if slide.get("title"):
+                text_to_read = slide["title"]
+            else:
+                text_to_read = slide.get("body","")
+            if not text_to_read or len(text_to_read.strip()) == 0:
+                temp_audio_paths.append(None); continue
+            if len(text_to_read) > MAX_SLIDE_CHARS:
+                text_to_read = text_to_read[:MAX_SLIDE_CHARS].rsplit(" ",1)[0] + "..."
+            audio_file = os.path.join(base, f"slide_audio_{idx}.mp3")
+            ok = await synthesize_slide_tts(text_to_read, audio_file)
+            if not ok:
+                # fallback: short silent audio
+                silent = AudioClip(lambda t: 0*t, duration=3.0).set_fps(44100)
+                silent.write_audiofile(audio_file, fps=44100, codec="mp3", verbose=False, logger=None)
+            temp_audio_paths.append(audio_file)
+
+        # filter/merge extremely short slides (again) using audio durations
+        filtered_slides = []
+        filtered_audio = []
+        for s, ap in zip(slides, temp_audio_paths):
+            body = (s.get("body") or "").strip()
+            title_flag = bool(s.get("title"))
+            audio_len = 0
+            if ap and os.path.exists(ap):
+                try:
+                    audio_len = AudioFileClip(ap).duration
+                except Exception:
+                    audio_len = 0
+            # decide keep/merge/skip
+            if title_flag or len(body) >= MIN_SLIDE_CHARS or audio_len > 0.5:
+                filtered_slides.append(s); filtered_audio.append(ap)
+            else:
+                # merge with previous if possible
+                if filtered_slides and not filtered_slides[-1].get("title"):
+                    prev = filtered_slides[-1]
+                    prev["body"] = (prev.get("body","") + "\n\n" + body).strip()
+                    # do NOT regenerate previous audio here (tradeoff for speed)
+                else:
+                    # skip silently
+                    print(f"[SKIP] dropping very short slide: '{body[:40]}'", flush=True)
+
+        slides = filtered_slides
+        temp_audio_paths = filtered_audio
+
+        if not slides:
+            print("[CRITICAL] No slides after filtering. Aborting.", flush=True); sys.exit(1)
+
+        # build clips per slide
+        slide_clips = []
+        total = len(slides)
+        for idx, (s, a) in enumerate(zip(slides, temp_audio_paths)):
+            if not a or not os.path.exists(a):
+                # make short silent file
+                fallback_a = os.path.join(base, f"slide_audio_fallback_{idx}.mp3")
+                silent = AudioClip(lambda t: 0*t, duration=3.0).set_fps(44100)
+                silent.write_audiofile(fallback_a, fps=44100, codec="mp3", verbose=False, logger=None)
+                a = fallback_a
+            clip = create_slide_clip(bg_path, grad_path, logo_clip, s, a, idx, total)
+            slide_clips.append(clip)
+
+        # concatenate
+        final = concatenate_videoclips(slide_clips, method="compose")
+
+        # write output
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        print(f"[INFO] Writing final video to {out_path} ...", flush=True)
+        final.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac", preset="medium", threads=4, ffmpeg_params=["-movflags","+faststart"])
+        print(f"[SUCCESS] Video saved: {out_path}", flush=True)
 
     except Exception as e:
-        print(f"\n[FATAL ERROR] {e}", flush=True)
+        print(f"[FATAL] {e}", flush=True)
         traceback.print_exc()
         sys.exit(1)
-
     finally:
+        # cleanup temp files
         try:
-            if os.path.exists(img_path):
-                os.remove(img_path)
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
+            for f in os.listdir(base):
+                if f.startswith("slide_audio_") and f.endswith(".mp3"):
+                    try: os.remove(os.path.join(base,f))
+                    except: pass
+                if f.startswith("slide_audio_fallback_") and f.endswith(".mp3"):
+                    try: os.remove(os.path.join(base,f))
+                    except: pass
+            if os.path.exists(bg_path): os.remove(bg_path)
+            if os.path.exists(grad_path): os.remove(grad_path)
+            if os.path.exists("logo_temp.png"): os.remove("logo_temp.png")
         except Exception:
             pass
 
