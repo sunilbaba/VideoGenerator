@@ -1,8 +1,9 @@
 yfinance
 edge-tts
-moviepy
+moviepy==1.0.3
 Pillow
 deep-translator
+mplfinance
 pandas
 requests
 beautifulsoup4
