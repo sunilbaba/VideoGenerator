@@ -4,8 +4,8 @@ import random
 import requests
 import asyncio
 import time
-import urllib.parse  # <--- NEW: For safe URL encoding
-import traceback     # <--- NEW: For printing full error logs
+import urllib.parse
+import traceback
 from datetime import datetime
 
 # --- LIBRARIES ---
@@ -85,7 +85,7 @@ def prepare_script_and_visuals(data):
     english_script = (
         f"Breaking Stock Market Update! Let's talk about {data['name']}. "
         f"The stock is currently trading at {data['price']} rupees. "
-        f"According to {data['publisher']}, reports say: {data['headline']}.. "
+        f"According to {data['publisher']}, reports say: {data['headline']}. "
         f"With a market valuation of {data['mcap']} crore rupees, this is a key level to watch. "
         "Stay subscribed for more Indian market updates."
     )
@@ -98,7 +98,7 @@ def prepare_script_and_visuals(data):
         print(f" [!] Translation Failed: {e}", flush=True)
         telugu_script = english_script 
 
-    # SIMPLIFIED PROMPT (Better for API success)
+    # Simplified Prompt
     image_prompt = (
         f"cinematic shot of {data['name']} office building, "
         f"stock market graph overlay, financial news studio, "
@@ -111,36 +111,34 @@ def prepare_script_and_visuals(data):
         "prompt": image_prompt
     }
 
-# --- IMPROVED IMAGE GENERATOR WITH LOGGING ---
+# --- NEW ROBUST IMAGE GENERATOR ---
 def get_ai_image(prompt, filename):
     print(f"[*] Generating Image...", flush=True)
-    
-    # 1. URL ENCODE THE PROMPT (Fixes broken URLs)
     encoded_prompt = urllib.parse.quote(prompt)
     seed = random.randint(1, 99999)
     
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&seed={seed}&model=flux&nologo=true"
+    # LIST OF MODELS TO TRY (If one fails, try the next)
+    # Flux = Best Quality, Turbo = Fastest/Most Reliable
+    models_to_try = ["flux", "turbo", "midijourney"]
     
-    # 2. RETRY MECHANISM (Tries 3 times before failing)
-    for attempt in range(1, 4):
+    for model in models_to_try:
+        print(f"   [Attempt] Trying Model: {model}...", flush=True)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&seed={seed}&model={model}&nologo=true"
+        
         try:
-            print(f"   [Attempt {attempt}] Requesting Image...", flush=True)
             response = requests.get(url, timeout=60)
-            
             if response.status_code == 200:
                 with open(filename, 'wb') as f:
                     f.write(response.content)
-                print("   [SUCCESS] Image saved.", flush=True)
+                print(f"   [SUCCESS] Image generated with {model}.", flush=True)
                 return True
             else:
-                # LOG THE SPECIFIC ERROR CODE
-                print(f"   [ERROR] Status Code: {response.status_code}", flush=True)
-                print(f"   [ERROR] Message: {response.text}", flush=True)
+                print(f"   [WARN] {model} Failed (Status {response.status_code}). Switching model...", flush=True)
         
         except Exception as e:
-            print(f"   [EXCEPTION] {e}", flush=True)
+            print(f"   [WARN] Connection failed for {model}: {e}", flush=True)
         
-        time.sleep(2) # Wait 2 seconds before retry
+        time.sleep(1) # Short pause before next model
         
     return False
 
@@ -177,7 +175,7 @@ def render_video(image_path, audio_path, output_path):
         return True
     except Exception as e:
         print(f"[ERROR] Render failed: {e}", flush=True)
-        traceback.print_exc() # Print full crash report
+        traceback.print_exc()
         return False
 
 async def main():
@@ -190,23 +188,23 @@ async def main():
     audio_path = os.path.join(base_dir, "temp_voice.mp3")
     
     try:
-        # 1. Get Data
         stock_data = get_trending_stock()
         video_content = prepare_script_and_visuals(stock_data)
         
         final_filename = f"{video_content['title']}_{timestamp}.mp4"
         output_path = os.path.join(base_dir, OUTPUT_FOLDER, final_filename)
         
-        # 2. Generate Assets (With checks)
+        # 1. Image Generation (With Fallback)
         if not get_ai_image(video_content['prompt'], img_path):
-            print("[CRITICAL] Could not generate image after 3 attempts.", flush=True)
+            print("[CRITICAL] All image models failed. Exiting.", flush=True)
             sys.exit(1)
             
+        # 2. Audio Generation
         if not await generate_audio(video_content['script'], audio_path):
-            print("[CRITICAL] Could not generate audio.", flush=True)
+            print("[CRITICAL] Audio generation failed.", flush=True)
             sys.exit(1)
         
-        # 3. Render
+        # 3. Video Render
         if render_video(img_path, audio_path, output_path):
             print(f"\n[SUCCESS] Video Saved: {output_path}", flush=True)
         else:
@@ -214,12 +212,11 @@ async def main():
             sys.exit(1)
 
     except Exception as e:
-        print(f"\n[FATAL SCRIPT ERROR] {e}", flush=True)
+        print(f"\n[FATAL ERROR] {e}", flush=True)
         traceback.print_exc()
         sys.exit(1)
         
     finally:
-        # Cleanup
         if os.path.exists(img_path): os.remove(img_path)
         if os.path.exists(audio_path): os.remove(audio_path)
 
