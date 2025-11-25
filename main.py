@@ -15,10 +15,10 @@ from moviepy.editor import *
 import PIL.Image
 from deep_translator import GoogleTranslator
 
-# --- NEW: CHARTING & TECHNICALS ---
+# --- CHARTING ---
 import mplfinance as mpf
 import pandas as pd
-import pandas_ta as ta
+# Removed pandas_ta to fix installation errors
 
 # --- CONFIGURATION ---
 OUTPUT_FOLDER = "generated_videos"
@@ -47,35 +47,38 @@ WATCHLIST = [
 ]
 
 # ==========================================
-# 1. NEW: TECHNICAL ANALYSIS & CHARTING
+# 1. TECHNICAL ANALYSIS (Native Pandas)
 # ==========================================
 
 def generate_technical_chart(ticker, name, filename):
     print(f"[*] Generating Technical Chart for {name}...", flush=True)
     try:
-        # Get last 6 months of data
-        df = yf.download(ticker, period="6mo", interval="1d", progress=False)
+        # Get last 1 year of data to ensure we have enough for 200 SMA
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
         
         if df.empty: return False
         
-        # Calculate Moving Averages
-        df['SMA_50'] = ta.sma(df['Close'], length=50)
-        df['SMA_200'] = ta.sma(df['Close'], length=200)
+        # --- FIX: Calculate Moving Averages using standard Pandas ---
+        # This replaces 'pandas_ta' and avoids the installation error
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
 
-        # Create Custom Style for Chart
-        mc = mpf.make_marketcolors(up='g', down='r', inherit=True)
+        # Slice data to show only the last 6 months (so the chart isn't squished)
+        df_plot = df.tail(120) 
+
+        # Create Custom Style
+        mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
         s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
 
-        # Plot Settings
+        # Plot Settings (Cyan for 50 SMA, Orange for 200 SMA)
         add_plots = [
-            mpf.make_addplot(df['SMA_50'], color='cyan', width=1.5, panel=0),  # 50 SMA
-            mpf.make_addplot(df['SMA_200'], color='orange', width=1.5, panel=0) # 200 SMA
+            mpf.make_addplot(df_plot['SMA_50'], color='cyan', width=2, panel=0),
+            mpf.make_addplot(df_plot['SMA_200'], color='orange', width=2, panel=0)
         ]
         
-        # Save Chart as Image
-        # We make it square-ish to fit in the video center
+        # Save Chart
         mpf.plot(
-            df, 
+            df_plot, 
             type='candle', 
             style=s, 
             addplot=add_plots,
@@ -94,11 +97,10 @@ def generate_technical_chart(ticker, name, filename):
 
 def get_market_analysis_data():
     """
-    Fallback function: Analyzes Nifty 50 or Bank Nifty if no specific stock news is found.
+    Fallback function: Analyzes Nifty 50 or Bank Nifty.
     """
     print("[!] No stock news found. Switching to Market Technical Analysis...", flush=True)
     
-    # Randomly pick Nifty 50 or Bank Nifty
     indices = [
         {"ticker": "^NSEI", "name": "Nifty 50"},
         {"ticker": "^NSEBANK", "name": "Bank Nifty"}
@@ -106,7 +108,6 @@ def get_market_analysis_data():
     target = random.choice(indices)
     
     try:
-        # Fetch Data
         stock = yf.Ticker(target['ticker'])
         hist = stock.history(period="1mo")
         current_price = hist['Close'].iloc[-1]
@@ -114,9 +115,7 @@ def get_market_analysis_data():
         change = current_price - prev_close
         pct_change = (change / prev_close) * 100
         
-        # Simple Technical Commentary
         trend = "bullish" if current_price > prev_close else "bearish"
-        trend_telugu = "positve" if trend == "bullish" else "negative" # Simple words for translation
         
         script = (
             f"Market Analysis Report for {target['name']}. "
@@ -133,7 +132,7 @@ def get_market_analysis_data():
             "ticker": target['ticker'],
             "name": target['name'],
             "script": script,
-            "prompt": f"stock market bull and bear fighting, {target['name']} chart background, glowing financial lines, 8k" # Backup prompt
+            "prompt": f"stock market chart background, {target['name']}, financial lines, 8k"
         }
         
     except Exception as e:
@@ -159,6 +158,7 @@ def get_trending_stock():
                 title = latest_news.get('title', 'Market Update')
                 publisher = latest_news.get('publisher', 'News Source')
                 
+                # Filter out junk titles
                 if len(title) < 5: continue
 
                 info = stock.info
@@ -198,8 +198,6 @@ def get_visuals_robust(data, filename):
     if data['type'] == 'technical':
         chart_filename = filename.replace(".jpg", "_chart.jpg")
         if generate_technical_chart(data['ticker'], data['name'], chart_filename):
-            # If chart succeeds, we use it as the image!
-            # We rename it to the expected filename
             if os.path.exists(filename): os.remove(filename)
             os.rename(chart_filename, filename)
             return True
@@ -231,7 +229,7 @@ def get_visuals_robust(data, filename):
             return True
     except: pass
     
-    # ULTIMATE FALLBACK: Download generic image
+    # ULTIMATE FALLBACK
     print("   [FALLBACK] Downloading generic image...", flush=True)
     try:
         with open(filename, 'wb') as f:
@@ -242,9 +240,7 @@ def get_visuals_robust(data, filename):
 async def generate_audio_telugu(text, filename):
     print("[*] Translating & Generating Audio...", flush=True)
     try:
-        # Translate
         telugu_text = GoogleTranslator(source='auto', target='te').translate(text)
-        # Generate
         communicate = edge_tts.Communicate(telugu_text, VOICE)
         await communicate.save(filename)
         return True
@@ -258,18 +254,13 @@ def render_video(image_path, audio_path, output_path):
         audio_clip = AudioFileClip(audio_path)
         duration = audio_clip.duration + 1.0
         
-        # Load Image
         img_clip = ImageClip(image_path).set_duration(duration)
-        
-        # Smart Resize
         img_w, img_h = img_clip.size
-        # If it's a generated chart (square-ish), we want to fit it inside the black screen
-        # If it's a full AI image (portrait), we want to crop/pan it
         
-        if img_w > img_h: # It's likely a chart
+        if img_w > img_h: # It's a chart (Square/Landscape)
              img_clip = img_clip.resize(width=1080)
              img_clip = img_clip.set_position("center")
-        else: # It's a vertical image
+        else: # It's a vertical AI image
              img_clip = img_clip.resize(RESIZE_DIM)
              if VIDEO_MODE == "PORTRAIT":
                 img_clip = img_clip.set_position(lambda t: ('center', -50 - (t * 20)))
@@ -300,10 +291,8 @@ async def main():
     audio_path = os.path.join(base_dir, "temp_voice.mp3")
     
     try:
-        # 1. Try to get News
         data = get_trending_stock()
         
-        # 2. If NO News, Switch to Technical Analysis
         if not data:
             data = get_market_analysis_data()
             
@@ -316,11 +305,9 @@ async def main():
         final_filename = f"{data['title']}_{timestamp}.mp4"
         output_path = os.path.join(base_dir, OUTPUT_FOLDER, final_filename)
         
-        # 3. Generate Assets
         if not get_visuals_robust(data, img_path): sys.exit(1)
         if not await generate_audio_telugu(data['script'], audio_path): sys.exit(1)
         
-        # 4. Render
         if render_video(img_path, audio_path, output_path):
             print(f"\n[SUCCESS] Video Saved: {output_path}", flush=True)
         else:
