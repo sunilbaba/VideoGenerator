@@ -1,60 +1,46 @@
-name: Generate Anomaly Short
+name: Generate Video (CI)
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build-and-commit:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Generator Script
-        run: python main.py
-
-      - name: Debug - List Generated Files
+      - name: Export optional secrets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
+          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
         run: |
-          echo "Listing current directory:"
-          ls -R
-          echo "Checking generated_videos folder:"
-          ls -R generated_videos/ || echo "Folder not found"
+          echo "HF_TOKEN set: ${HF_TOKEN:+yes}"
+          echo "UNSPLASH_ACCESS_KEY set: ${UNSPLASH_ACCESS_KEY:+yes}"
 
-      - name: Commit and Push
+      - name: Run generator
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
+          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
         run: |
-          git config --global user.name "AnomalyBot"
-          git config --global user.email "actions@github.com"
-          
-          git add generated_videos/*.mp4
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit. Video generation likely failed."
-            exit 1
-          else
-            git commit -m "🎥 Generated new video [skip ci]"
-            git push
-          fi
-        # Add 'continue-on-error' so artifact uploads even if push fails
-        continue-on-error: true 
-
-      # --- NEW STEP: ADDS DOWNLOAD BUTTON ---
-      - name: Upload Video as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Anomaly-Short-Video
-          path: generated_videos/*.mp4
+          python your_script.py
