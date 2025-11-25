@@ -1,63 +1,53 @@
-name: Generate Video (CI)
+name: Daily Shorts Generator
 
 on:
-  push:
-    branches: [ main ]
+  # Schedule: Runs at 03:30 UTC every day (which is 09:00 AM IST)
+  schedule:
+    - cron: '30 12 * * *'
+  
+  # Manual Trigger: Allows you to click "Run workflow" in GitHub UI for testing
   workflow_dispatch:
 
 jobs:
-  build:
+  build-and-render:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
-      - name: Show python & pip (debug)
-        run: |
-          python --version
-          pip --version
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
 
-      - name: Install system packages (ffmpeg, fonts)
+      # FFmpeg is required by MoviePy to render the final MP4
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          # ffmpeg for moviepy; fonts so PIL can load DejaVuSans
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-dejavu-extra
-          # optional utilities (keep small)
-          sudo apt-get install -y libsndfile1
+          sudo apt-get install -y ffmpeg
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Python dependencies
+      # Downloads a professional font so the video doesn't look broken
+      - name: Download Fonts
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          mkdir -p fonts
+          wget -O fonts/Roboto-Bold.ttf https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Bold.ttf
 
-      - name: Print env secrets presence
+      - name: Install Python Libraries
+        run: |
+          pip install --upgrade pip
+          pip install moviepy==1.0.3 Pillow>=10.0.0 requests edge-tts deep-translator yfinance beautifulsoup4
+
+      - name: Run Generator Script
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
-        run: |
-          echo "HF_TOKEN present? -> ${HF_TOKEN:+YES}"
-          echo "UNSPLASH_ACCESS_KEY present? -> ${UNSPLASH_ACCESS_KEY:+YES}"
+          # Python won't buffer output, so you see print statements immediately in logs
+          PYTHONUNBUFFERED: 1
+        run: python main.py
 
-      - name: Run generator script
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY || '' }}
-        run: |
-          python main.py
-
-      - name: Upload Video as Artifact
+      # Uploads the video as a zip/artifact you can download from the GitHub Actions summary page
+      - name: Upload Video Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Generated-Short-Video
+          name: generated-video-files
           path: generated_videos/*.mp4
-          if-no-files-found: warn
+          retention-days: 5
