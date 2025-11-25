@@ -15,10 +15,6 @@ from moviepy.editor import *
 import PIL.Image
 from deep_translator import GoogleTranslator
 
-# --- FIX FOR PILLOW ERROR ---
-if not hasattr(PIL.Image, 'ANTIALIAS'):
-    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
-
 # --- CONFIGURATION ---
 OUTPUT_FOLDER = "generated_videos"
 VIDEO_MODE = "PORTRAIT" 
@@ -31,6 +27,14 @@ else:
     RESIZE_DIM = (3415, 1920)
 
 VOICE = "te-IN-ShrutiNeural"
+
+# --- RELIABLE FALLBACK IMAGES (Wikimedia Commons) ---
+# Used if ALL AI generation fails, ensuring the video still renders.
+FALLBACK_IMAGES = [
+    "https://upload.wikimedia.org/wikipedia/commons/e/e1/Stock_Market_prices.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b3/Stock_market_wall_street.jpg/1280px-Stock_market_wall_street.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/New_York_Stock_Exchange_-_panoramio_%283%29.jpg/1280px-New_York_Stock_Exchange_-_panoramio_%283%29.jpg"
+]
 
 # --- STOCK LIST ---
 WATCHLIST = [
@@ -98,11 +102,9 @@ def prepare_script_and_visuals(data):
         print(f" [!] Translation Failed: {e}", flush=True)
         telugu_script = english_script 
 
-    # Simplified Prompt
     image_prompt = (
-        f"cinematic shot of {data['name']} office building, "
-        f"stock market graph overlay, financial news studio, "
-        "8k, photorealistic"
+        f"stock market concept art for {data['name']}, financial graph rising, "
+        "digital currency background, cinematic lighting, 8k, photorealistic"
     )
     
     return {
@@ -111,37 +113,86 @@ def prepare_script_and_visuals(data):
         "prompt": image_prompt
     }
 
-# --- NEW ROBUST IMAGE GENERATOR ---
-def get_ai_image(prompt, filename):
-    print(f"[*] Generating Image...", flush=True)
-    encoded_prompt = urllib.parse.quote(prompt)
-    seed = random.randint(1, 99999)
+# --- GENERATION ENGINE ---
+def generate_image_huggingface(prompt, filename):
+    """
+    Uses Hugging Face Inference API. Requires HF_TOKEN in secrets.
+    """
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("   [WARN] No HF_TOKEN found. Skipping Hugging Face.", flush=True)
+        return False
+
+    print("   [Attempt] Trying Hugging Face (Stable Diffusion XL)...", flush=True)
+    API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    headers = {"Authorization": f"Bearer {token}"}
     
-    # LIST OF MODELS TO TRY (If one fails, try the next)
-    # Flux = Best Quality, Turbo = Fastest/Most Reliable
-    models_to_try = ["flux", "turbo", "midijourney"]
-    
-    for model in models_to_try:
-        print(f"   [Attempt] Trying Model: {model}...", flush=True)
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&seed={seed}&model={model}&nologo=true"
-        
-        try:
-            response = requests.get(url, timeout=60)
-            if response.status_code == 200:
-                with open(filename, 'wb') as f:
-                    f.write(response.content)
-                print(f"   [SUCCESS] Image generated with {model}.", flush=True)
-                return True
-            else:
-                print(f"   [WARN] {model} Failed (Status {response.status_code}). Switching model...", flush=True)
-        
-        except Exception as e:
-            print(f"   [WARN] Connection failed for {model}: {e}", flush=True)
-        
-        time.sleep(1) # Short pause before next model
-        
+    try:
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=60)
+        if response.status_code == 200:
+            with open(filename, "wb") as f:
+                f.write(response.content)
+            print("   [SUCCESS] Image generated via Hugging Face.", flush=True)
+            return True
+        else:
+            print(f"   [FAIL] HF Status: {response.status_code} {response.text}", flush=True)
+            return False
+    except Exception as e:
+        print(f"   [FAIL] HF Error: {e}", flush=True)
+        return False
+
+def generate_image_pollinations(prompt, filename):
+    """
+    Free API, often blocked by GitHub IPs.
+    """
+    print("   [Attempt] Trying Pollinations (Flux)...", flush=True)
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width={RESOLUTION[0]}&height={RESOLUTION[1]}&model=flux&nologo=true"
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+            print("   [SUCCESS] Image generated via Pollinations.", flush=True)
+            return True
+    except:
+        pass
     return False
 
+def download_fallback_image(filename):
+    """
+    Downloads a real stock market image from Wikimedia if AI fails.
+    """
+    print("   [FALLBACK] AI failed. Downloading generic stock image...", flush=True)
+    url = random.choice(FALLBACK_IMAGES)
+    try:
+        # Fake user agent to avoid Wikipedia blocking
+        headers = {'User-Agent': 'Mozilla/5.0'} 
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+            print("   [SUCCESS] Fallback image saved.", flush=True)
+            return True
+    except Exception as e:
+        print(f"   [CRITICAL] Fallback failed: {e}", flush=True)
+    return False
+
+def get_visuals_robust(prompt, filename):
+    print(f"[*] Starting Visual Generation Pipeline...", flush=True)
+    
+    # 1. Try Hugging Face (Best Quality)
+    if generate_image_huggingface(prompt, filename): return True
+    
+    # 2. Try Pollinations (Backup)
+    if generate_image_pollinations(prompt, filename): return True
+    
+    # 3. Last Resort (Wikimedia)
+    if download_fallback_image(filename): return True
+    
+    return False
+
+# --- AUDIO ---
 async def generate_audio(text, filename):
     print(f"[*] Generating Audio...", flush=True)
     try:
@@ -152,6 +203,7 @@ async def generate_audio(text, filename):
         print(f"[ERROR] Audio failed: {e}", flush=True)
         return False
 
+# --- RENDER ---
 def render_video(image_path, audio_path, output_path):
     print("[*] Rendering Video...", flush=True)
     try:
@@ -178,6 +230,7 @@ def render_video(image_path, audio_path, output_path):
         traceback.print_exc()
         return False
 
+# --- MAIN ---
 async def main():
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
@@ -194,17 +247,17 @@ async def main():
         final_filename = f"{video_content['title']}_{timestamp}.mp4"
         output_path = os.path.join(base_dir, OUTPUT_FOLDER, final_filename)
         
-        # 1. Image Generation (With Fallback)
-        if not get_ai_image(video_content['prompt'], img_path):
-            print("[CRITICAL] All image models failed. Exiting.", flush=True)
+        # 1. Generate Visuals (With 3-Layer Fallback)
+        if not get_visuals_robust(video_content['prompt'], img_path):
+            print("[CRITICAL] All visual generation methods failed.", flush=True)
             sys.exit(1)
             
-        # 2. Audio Generation
+        # 2. Audio
         if not await generate_audio(video_content['script'], audio_path):
             print("[CRITICAL] Audio generation failed.", flush=True)
             sys.exit(1)
         
-        # 3. Video Render
+        # 3. Render
         if render_video(img_path, audio_path, output_path):
             print(f"\n[SUCCESS] Video Saved: {output_path}", flush=True)
         else:
